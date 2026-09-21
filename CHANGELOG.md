@@ -14,4 +14,4 @@ First cut of the Tessera binary.
 - Docker runtime, a `ctr` path, and a fake runtime. Drills use fake.
 - Read-only MCP tools and `tessera ask`. Optional LLM note via `TESSERA_LLM_URL`.
 - Kubernetes manifest import, including `--from-cluster` through `kubectl`.
-- Licensed under the GNU Affero General Public License v3 only.
+- Licensed under the Apache License, Version 2.0.

@@ -92,10 +92,8 @@ go test ./internal/drill -count=1
 
 ## License
 
-Copyright (C) 2026 Clarke.
+Copyright 2026 Clarke.
 
-Tessera is free software under the GNU Affero General Public License, version 3 only. See `LICENSE`.
+Tessera is licensed under the Apache License, Version 2.0. See `LICENSE`.
 
-You may use, modify, and contribute. If you distribute Tessera, or run a modified version as a network service, you must offer the corresponding source under the same license. You may not relicense it as proprietary.
-
-This license covers the code. It does not stop someone from writing their own system with the same idea.
+Use, modify, and contribute. A company can ship Tessera, including inside a product, without a special agreement. Contributions are licensed the same way, and each contributor grants a patent license for their contribution.
