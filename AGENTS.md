@@ -32,4 +32,4 @@ Module `tessera`. One binary: `cmd/tessera`. No Makefile or CI. Verify with `go 
 
 ## Style
 
-Match the tree: no comments, hand-rolled CLI flags rather than cobra. `go test` is the check; there is no separate lint or codegen step. User-facing docs are `README.md` and `CHANGELOG.md` only.
+Match the tree: no comments, hand-rolled CLI flags rather than cobra. `go test` is the check; there is no separate lint or codegen step. User-facing docs are `README.md`, `CHANGELOG.md`, and `ROADMAP.md` only.

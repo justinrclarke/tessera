@@ -4,6 +4,8 @@ Tessera is a single Go binary that runs containers across machines on a LAN. You
 
 Healing is deterministic. A model is optional, and only for explanation. If the controller dies, a node with the newest signed snapshot can take over. Wipe, reimage, and delete are never done automatically.
 
+What is coming next is in [ROADMAP.md](ROADMAP.md).
+
 ## Run
 
 ```
