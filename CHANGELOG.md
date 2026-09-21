@@ -1,5 +1,12 @@
 # Changelog
 
+## 0.1.1
+
+Roadmap only. No runtime change.
+
+- Version order is priority order. Next is the CLI session, then the real-machine path, the Kubernetes bridge, and controller replication. Inference, training, public images, cloud, and infrastructure-as-code follow. Netboot stays unscheduled.
+- Direct modules stay on the known set: `gopkg.in/yaml.v3`, `github.com/hashicorp/mdns`, `github.com/modelcontextprotocol/go-sdk`, `golang.org/x/sys`, and `modernc.org/sqlite`. A new one is a roadmap change.
+
 ## 0.1.0
 
 First cut of the Tessera binary.

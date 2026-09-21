@@ -9,6 +9,7 @@ Module `tessera`. One binary: `cmd/tessera`. No Makefile or CI. Verify with `go 
 - User kinds are App, Job, Model, Route, Config, Secret, Policy. Node and Assignment are system objects.
 - MCP tools in `internal/mcp` are read-only. Mutations go through apply or playbooks.
 - `k8simport` converts Deployment, StatefulSet, DaemonSet, Job, Service, Ingress, ConfigMap, and Secret. It does not link client-go. `--from-cluster` shells out to `kubectl`. Report skipped kinds; do not drop them silently.
+- Do not add a Go module outside the known set in `ROADMAP.md`: `gopkg.in/yaml.v3`, `github.com/hashicorp/mdns`, `github.com/modelcontextprotocol/go-sdk`, `golang.org/x/sys`, `modernc.org/sqlite`, plus the standard library. A new direct dependency is a roadmap change.
 
 ## Behavior that is easy to break
 
