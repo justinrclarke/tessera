@@ -1,0 +1,28 @@
+# go build -o tessera ./cmd/tessera
+/tessera
+/tessera.exe
+
+# go test -c and go test -coverprofile
+*.test
+*.out
+
+# default backup: tessera backup -o tessera-backup.db
+*.db
+*.db-wal
+*.db-shm
+*.db-journal
+
+# tessera up / agent state. client.json and token are credentials.
+.tessera/
+data/
+/client.json
+/token
+/cache.json
+/node.crt
+/node.key
+/agent/
+.bench
+
+# local editor
+.idea/
+.DS_Store
