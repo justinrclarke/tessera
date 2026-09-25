@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	"errors"
 	"flag"
 	"fmt"
 	"io"
@@ -64,6 +65,8 @@ func run(args []string) error {
 		return cmdApply(args[1:])
 	case "get":
 		return cmdGet(args[1:])
+	case "confirm":
+		return cmdConfirm(args[1:])
 	case "ask":
 		return cmdAsk(args[1:])
 	case "mcp":
@@ -97,6 +100,7 @@ from a signed snapshot if the current one dies. Destructive actions stay propose
   tessera up [--listen :7468] [--runtime auto|docker|ctr|fake]
   tessera apply -f app.yaml
   tessera get apps|nodes|assignments|actions|routes
+  tessera confirm [id]
   tessera ask "why is web down"
   tessera agent [--url http://controller:7468]
   tessera import -f deploy.yaml
@@ -142,6 +146,10 @@ func cmdUp(args []string) error {
 		Addr:    advertiseHost(*listen),
 	}
 	err = ag.Run(ctx)
+	if errors.Is(err, agent.ErrHalted) {
+		<-ctx.Done()
+		return nil
+	}
 	if ctx.Err() != nil {
 		return nil
 	}
@@ -171,6 +179,7 @@ func cmdAgent(args []string) error {
 	fs := flag.NewFlagSet("agent", flag.ContinueOnError)
 	urlFlag := fs.String("url", "", "controller URL; discovered over mDNS if empty")
 	token := fs.String("token", os.Getenv("TESSERA_TOKEN"), "cluster token")
+	id := fs.String("id", os.Getenv("TESSERA_NODE_ID"), "stable node ID")
 	data := fs.String("data", filepath.Join(config.Dir(), "agent"), "agent data directory")
 	runtimeName := fs.String("runtime", "auto", "container runtime")
 	if err := fs.Parse(args); err != nil {
@@ -213,9 +222,9 @@ func cmdAgent(args []string) error {
 	if err != nil {
 		return fmt.Errorf("runtime: %w", err)
 	}
-	ag := &agent.Agent{DataDir: *data, Token: *token, URL: url, Client: client.New(url, *token), Runtime: rtm}
+	ag := &agent.Agent{ID: *id, DataDir: *data, Token: *token, URL: url, Client: client.New(url, *token), Runtime: rtm}
 	err = ag.Run(ctx)
-	if ctx.Err() != nil {
+	if ctx.Err() != nil || errors.Is(err, agent.ErrHalted) {
 		return nil
 	}
 	return err
@@ -290,9 +299,9 @@ func cmdGet(args []string) error {
 		if err != nil {
 			return err
 		}
-		fmt.Printf("%-20s %-10s %12s %8s\n", "ID", "STATUS", "SCORE", "GPUS")
+		fmt.Printf("%-20s %-10s %12s %12s %12s %8s\n", "ID", "STATUS", "CPU", "MEM", "DISK", "GPUS")
 		for _, n := range nodes {
-			fmt.Printf("%-20s %-10s %12.0f %8d\n", n.ID, n.Status, n.Perf.CPU/1e6, n.GPUs)
+			fmt.Printf("%-20s %-10s %12.0f %12.0f %12.0f %8d\n", n.ID, n.Status, n.Perf.CPU, n.Perf.Memory, n.Perf.Disk, n.GPUs)
 		}
 	case "assignments":
 		asgs, err := cl.ListAssignments(ctx)
@@ -321,6 +330,36 @@ func cmdGet(args []string) error {
 	default:
 		return fmt.Errorf("unknown resource %q", fs.Arg(0))
 	}
+	return nil
+}
+
+func cmdConfirm(args []string) error {
+	fs := flag.NewFlagSet("confirm", flag.ContinueOnError)
+	if err := fs.Parse(args); err != nil {
+		return err
+	}
+	cl, err := openClient()
+	if err != nil {
+		return err
+	}
+	ctx := context.Background()
+	if fs.NArg() == 0 {
+		actions, err := cl.ListActions(ctx)
+		if err != nil {
+			return err
+		}
+		for _, a := range actions {
+			if a.Result == "proposed" {
+				fmt.Printf("%s %s %s %s\n", a.ID, a.Kind, a.Target, a.Reason)
+			}
+		}
+		return nil
+	}
+	result, err := cl.Confirm(ctx, fs.Arg(0))
+	if err != nil {
+		return err
+	}
+	fmt.Println(result)
 	return nil
 }
 
@@ -524,7 +563,7 @@ func startController(ctx context.Context, listen, data string) (*controller.Serv
 	if err != nil {
 		return nil, nil, err
 	}
-	srv, err := controller.New(st, controller.Config{DataDir: data})
+	srv, err := controller.New(st, controller.Config{DataDir: data, Token: os.Getenv("TESSERA_TOKEN")})
 	if err != nil {
 		return nil, nil, err
 	}

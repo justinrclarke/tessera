@@ -3,6 +3,7 @@ package controller
 import (
 	"crypto/subtle"
 	"encoding/json"
+	"fmt"
 	"io"
 	"net/http"
 	"strconv"
@@ -13,6 +14,7 @@ import (
 	"tessera/internal/ask"
 	"tessera/internal/client"
 	"tessera/internal/diagnose"
+	"tessera/internal/images"
 	"tessera/internal/pki"
 	"tessera/internal/policy"
 	"tessera/internal/survive"
@@ -259,6 +261,7 @@ func (s *Server) handleHeartbeat(w http.ResponseWriter, r *http.Request) {
 	if snap, _, err := s.Store.LatestSnapshot(); err == nil {
 		resp.SnapshotIndex = snap.Index
 	}
+	resp.Command = s.pendingCommandLocked(id)
 	s.mu.Unlock()
 	_ = s.Reconcile(now)
 	writeJSON(w, http.StatusOK, resp)
@@ -280,16 +283,26 @@ func (s *Server) handleAssignments(w http.ResponseWriter, r *http.Request) {
 		s.waiters = append(s.waiters, ch)
 		s.mu.Unlock()
 		timer := time.NewTimer(time.Duration(waitMs) * time.Millisecond)
+		canceled := false
 		select {
 		case <-ch:
 		case <-timer.C:
 		case <-r.Context().Done():
-			timer.Stop()
-			http.Error(w, "canceled", http.StatusRequestTimeout)
-			return
+			canceled = true
 		}
 		timer.Stop()
 		s.mu.Lock()
+		for i, waiter := range s.waiters {
+			if waiter == ch {
+				s.waiters = append(s.waiters[:i], s.waiters[i+1:]...)
+				break
+			}
+		}
+		if canceled {
+			s.mu.Unlock()
+			http.Error(w, "canceled", http.StatusRequestTimeout)
+			return
+		}
 	}
 	page := client.Page{Rev: s.rev, Assignments: s.assignmentsForLocked(id)}
 	s.mu.Unlock()
@@ -363,6 +376,161 @@ func (s *Server) handleStatus(w http.ResponseWriter, r *http.Request) {
 	s.mu.Unlock()
 	_ = s.Reconcile(now)
 	writeJSON(w, http.StatusOK, map[string]bool{"ok": true})
+}
+
+func (s *Server) handleConfirm(w http.ResponseWriter, r *http.Request) {
+	if !s.leadingNow() {
+		http.Error(w, "not leader", http.StatusConflict)
+		return
+	}
+	id := r.PathValue("id")
+	now := s.now()
+	s.mu.Lock()
+	a, err := s.Store.GetAction(id)
+	if err != nil {
+		s.mu.Unlock()
+		http.Error(w, "not found", http.StatusNotFound)
+		return
+	}
+	if a.Result != "proposed" {
+		s.mu.Unlock()
+		http.Error(w, "not proposed", http.StatusConflict)
+		return
+	}
+	if a.Kind != "wipe" && a.Kind != "reimage" && a.Kind != "delete" {
+		s.mu.Unlock()
+		http.Error(w, "cannot confirm", http.StatusBadRequest)
+		return
+	}
+	switch a.Kind {
+	case "delete":
+		if _, nodeErr := s.Store.GetNode(a.Target); nodeErr == nil {
+			a.Result = "confirmed"
+		} else {
+			if err = s.applyDeleteLocked(a.Target); err != nil {
+				s.mu.Unlock()
+				http.Error(w, err.Error(), http.StatusNotFound)
+				return
+			}
+			a.Result = "done"
+		}
+	case "wipe", "reimage":
+		if _, err = s.Store.GetNode(a.Target); err != nil {
+			s.mu.Unlock()
+			http.Error(w, "unknown node", http.StatusNotFound)
+			return
+		}
+		a.Result = "confirmed"
+	}
+	if err := s.Store.UpdateAction(a); err != nil {
+		s.mu.Unlock()
+		http.Error(w, err.Error(), http.StatusInternalServerError)
+		return
+	}
+	kind := a.Kind
+	result := a.Result
+	s.mu.Unlock()
+	if kind == "delete" && result == "done" {
+		_ = s.Reconcile(now)
+	}
+	writeJSON(w, http.StatusOK, map[string]string{"result": result})
+}
+
+func (s *Server) handleActionResult(w http.ResponseWriter, r *http.Request) {
+	var req struct {
+		Result string `json:"result"`
+	}
+	if err := readJSON(w, r, &req); err != nil || req.Result == "" {
+		http.Error(w, "bad result", http.StatusBadRequest)
+		return
+	}
+	id := r.PathValue("id")
+	now := s.now()
+	s.mu.Lock()
+	a, err := s.Store.GetAction(id)
+	if err != nil {
+		s.mu.Unlock()
+		http.Error(w, "not found", http.StatusNotFound)
+		return
+	}
+	if a.Result != "confirmed" {
+		s.mu.Unlock()
+		http.Error(w, "not confirmed", http.StatusConflict)
+		return
+	}
+	if (a.Kind == "wipe" || a.Kind == "delete") && req.Result == "done" {
+		if err := s.Store.DeleteNode(a.Target); err != nil {
+			s.mu.Unlock()
+			http.Error(w, err.Error(), http.StatusInternalServerError)
+			return
+		}
+	}
+	a.Result = req.Result
+	if err := s.Store.UpdateAction(a); err != nil {
+		s.mu.Unlock()
+		http.Error(w, err.Error(), http.StatusInternalServerError)
+		return
+	}
+	s.mu.Unlock()
+	_ = s.Reconcile(now)
+	writeJSON(w, http.StatusOK, map[string]bool{"ok": true})
+}
+
+func (s *Server) applyDeleteLocked(target string) error {
+	if _, err := s.Store.GetApp(target); err == nil {
+		return s.Store.DeleteApp(target)
+	}
+	return fmt.Errorf("unknown target %s", target)
+}
+
+func (s *Server) pendingCommandLocked(nodeID string) *client.NodeCommand {
+	a, err := s.Store.PendingNodeAction(nodeID)
+	if err != nil {
+		return nil
+	}
+	return &client.NodeCommand{ID: a.ID, Kind: a.Kind}
+}
+
+func (s *Server) handleImage(w http.ResponseWriter, r *http.Request) {
+	ref := r.URL.Query().Get("ref")
+	if ref == "" {
+		http.Error(w, "ref required", http.StatusBadRequest)
+		return
+	}
+	dir := s.DataDir
+	if dir == "" {
+		http.Error(w, "no data dir", http.StatusInternalServerError)
+		return
+	}
+	switch r.Method {
+	case http.MethodHead:
+		if !images.Has(dir, ref) {
+			http.NotFound(w, r)
+			return
+		}
+		w.WriteHeader(http.StatusOK)
+	case http.MethodGet:
+		f, err := images.Open(dir, ref)
+		if err != nil {
+			http.NotFound(w, r)
+			return
+		}
+		defer f.Close()
+		w.Header().Set("Content-Type", "application/x-tar")
+		_, _ = io.Copy(w, f)
+	case http.MethodPut:
+		if !s.leadingNow() {
+			http.Error(w, "not leader", http.StatusConflict)
+			return
+		}
+		if err := images.Save(dir, ref, r.Body); err != nil {
+			http.Error(w, err.Error(), http.StatusInternalServerError)
+			return
+		}
+		w.WriteHeader(http.StatusNoContent)
+	default:
+		http.Error(w, "method", http.StatusMethodNotAllowed)
+	}
 }
 
 func (s *Server) handleActions(w http.ResponseWriter, r *http.Request) {

@@ -1,5 +1,14 @@
 # Changelog
 
+## 0.2.0 (local implementation verified)
+
+- A local Docker lab starts two isolated nodes and a sample Route, offers k6 load profiles and failure scenarios, and provides optional registry, PostgreSQL, Redis, and S3-compatible services. The sample workload reaches those services by name from either node. The clean-state drill verifies image transfer through the leader cache on failover and passed on macOS with OrbStack. Docker Desktop and native Linux host compatibility remains unverified.
+- `ctr` is tested. It uses the `tessera` namespace, skips a pull when the image is already present, and reports a host port.
+- A cluster image cache on the leader. A second start of a cached image does not pull from the registry.
+- Join benchmark is recorded once, refreshed hourly, and shown by `tessera get nodes`.
+- A route keeps its address and follows a move once the replacement is running.
+- `tessera confirm` runs a proposed wipe, reimage, or delete. Heal still does not.
+
 ## 0.1.1
 
 Roadmap only. No runtime change.

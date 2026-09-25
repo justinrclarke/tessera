@@ -107,6 +107,11 @@ func (s *Store) ListApps() ([]api.App, error) {
 	return list[api.App](s, `SELECT body FROM apps ORDER BY name`)
 }
 
+func (s *Store) DeleteApp(name string) error {
+	_, err := s.db.Exec(`DELETE FROM apps WHERE name=?`, name)
+	return err
+}
+
 func (s *Store) MarkHealthy(name string, generation int64) error {
 	a, err := s.GetApp(name)
 	if err != nil {
@@ -165,6 +170,11 @@ func (s *Store) ListNodes() ([]api.Node, error) {
 	return list[api.Node](s, `SELECT body FROM nodes ORDER BY id`)
 }
 
+func (s *Store) DeleteNode(id string) error {
+	_, err := s.db.Exec(`DELETE FROM nodes WHERE id=?`, id)
+	return err
+}
+
 func (s *Store) PutAssignment(a api.Assignment) error {
 	if a.Updated.IsZero() {
 		a.Updated = time.Now()
@@ -221,6 +231,34 @@ func (s *Store) ListActions(limit int) ([]api.Action, error) {
 		out = append(out, a)
 	}
 	return out, rows.Err()
+}
+
+func (s *Store) GetAction(id string) (api.Action, error) {
+	var body string
+	err := s.db.QueryRow(`SELECT body FROM actions WHERE id=?`, id).Scan(&body)
+	if err != nil {
+		return api.Action{}, err
+	}
+	var a api.Action
+	err = json.Unmarshal([]byte(body), &a)
+	return a, err
+}
+
+func (s *Store) PendingNodeAction(nodeID string) (api.Action, error) {
+	return one[api.Action](s, `SELECT body FROM actions
+		WHERE json_extract(body, '$.result')='confirmed'
+		AND json_extract(body, '$.target')=?
+		AND json_extract(body, '$.kind') IN ('wipe', 'reimage', 'delete')
+		ORDER BY at ASC LIMIT 1`, nodeID)
+}
+
+func (s *Store) UpdateAction(a api.Action) error {
+	b, err := json.Marshal(a)
+	if err != nil {
+		return err
+	}
+	_, err = s.db.Exec(`UPDATE actions SET body=? WHERE id=?`, string(b), a.ID)
+	return err
 }
 
 func (s *Store) HasAction(kind, target, reason string) (bool, error) {

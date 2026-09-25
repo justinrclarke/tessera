@@ -3,6 +3,7 @@ package store
 import (
 	"path/filepath"
 	"testing"
+	"time"
 
 	"tessera/internal/api"
 )
@@ -34,6 +35,23 @@ func TestAppGenerationAndRollback(t *testing.T) {
 	}
 	if rolled.Image != "nginx:1" || rolled.Generation != 1 {
 		t.Fatalf("%+v", rolled)
+	}
+}
+
+func TestPendingNodeActionBeyondRecentActions(t *testing.T) {
+	s := open(t)
+	base := time.Now()
+	if err := s.AddAction(api.Action{ID: "confirmed", At: base, Kind: "wipe", Target: "n1", Result: "confirmed"}); err != nil {
+		t.Fatal(err)
+	}
+	for i := 0; i < 60; i++ {
+		if err := s.AddAction(api.Action{ID: api.NewID(), At: base.Add(time.Duration(i+1) * time.Second), Kind: "move", Target: "web", Result: "done"}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	a, err := s.PendingNodeAction("n1")
+	if err != nil || a.ID != "confirmed" {
+		t.Fatalf("action %+v: %v", a, err)
 	}
 }
 

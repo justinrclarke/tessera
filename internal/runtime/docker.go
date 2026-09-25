@@ -151,6 +151,57 @@ func (d *Docker) Prune(ctx context.Context) error {
 	return err
 }
 
+func (d *Docker) HasImage(ctx context.Context, ref string) (bool, error) {
+	_, err := d.call(ctx, http.MethodGet, "/v1.41/images/"+url.PathEscape(imageRef(ref))+"/json", nil)
+	if err != nil {
+		return false, nil
+	}
+	return true, nil
+}
+
+func (d *Docker) ExportImage(ctx context.Context, ref string) (io.ReadCloser, error) {
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, "http://docker/v1.41/images/"+url.PathEscape(imageRef(ref))+"/get", nil)
+	if err != nil {
+		return nil, err
+	}
+	resp, err := d.http.Do(req)
+	if err != nil {
+		return nil, err
+	}
+	if resp.StatusCode >= 300 {
+		b, _ := io.ReadAll(io.LimitReader(resp.Body, 1024))
+		resp.Body.Close()
+		return nil, fmt.Errorf("docker export: %s", trim(b))
+	}
+	return resp.Body, nil
+}
+
+func (d *Docker) ImportImage(ctx context.Context, ref string, r io.Reader) error {
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, "http://docker/v1.41/images/load", r)
+	if err != nil {
+		return err
+	}
+	req.Header.Set("Content-Type", "application/x-tar")
+	resp, err := d.http.Do(req)
+	if err != nil {
+		return err
+	}
+	defer resp.Body.Close()
+	b, _ := io.ReadAll(io.LimitReader(resp.Body, 1024))
+	if resp.StatusCode >= 300 {
+		return fmt.Errorf("docker import: %s", trim(b))
+	}
+	return nil
+}
+
+func imageRef(image string) string {
+	name, tag := splitRef(image)
+	if tag == "" {
+		return name
+	}
+	return name + ":" + tag
+}
+
 func (d *Docker) pull(ctx context.Context, image string) error {
 	name, tag := splitRef(image)
 	ref := name

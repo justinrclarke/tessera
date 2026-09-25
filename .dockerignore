@@ -1,0 +1,9 @@
+.git
+.codex
+.agents
+lab/results
+__pycache__
+*.db
+*.db-shm
+*.db-wal
+tessera

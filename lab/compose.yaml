@@ -1,0 +1,191 @@
+name: tessera-lab
+
+services:
+  controller:
+    image: tessera-lab-tessera:local
+    build:
+      context: ..
+      dockerfile: lab/Dockerfile.tessera
+    command: ["controller", "--listen", "0.0.0.0:7468", "--data", "/data"]
+    environment:
+      TESSERA_TOKEN: tessera-local-lab-token
+      TESSERA_DATA: /data
+    volumes:
+      - controller-data:/data
+      - ./app.yaml:/lab/app.yaml:ro
+    ports:
+      - "127.0.0.1:7468:7468"
+      - "127.0.0.1:8088:8088"
+    healthcheck:
+      test: ["CMD", "wget", "-q", "-O", "/dev/null", "http://127.0.0.1:7468/v1/health"]
+      interval: 3s
+      timeout: 2s
+      retries: 20
+
+  node-a-docker:
+    image: docker:29-dind
+    privileged: true
+    command: ["--host=unix:///var/run/docker.sock", "--bip=${TESSERA_LAB_BRIDGE_IP:-172.30.250.1}/24", "--dns=${TESSERA_LAB_BRIDGE_IP:-172.30.250.1}"]
+    environment:
+      DOCKER_TLS_CERTDIR: ""
+    volumes:
+      - node-a-run:/var/run
+      - node-a-data:/var/lib/docker
+    healthcheck:
+      test: ["CMD", "docker", "info"]
+      interval: 3s
+      timeout: 2s
+      retries: 30
+
+  node-a:
+    image: tessera-lab-tessera:local
+    command: ["agent", "--url", "http://controller:7468", "--data", "/data", "--runtime", "docker", "--id", "lab-a"]
+    network_mode: "service:node-a-docker"
+    environment:
+      TESSERA_TOKEN: tessera-local-lab-token
+      DOCKER_HOST: unix:///var/run/docker.sock
+    volumes:
+      - node-a-run:/var/run
+      - node-a-state:/data
+    depends_on:
+      controller:
+        condition: service_healthy
+      node-a-docker:
+        condition: service_healthy
+      node-a-dns:
+        condition: service_started
+
+  node-a-dns:
+    image: python:3.13-alpine
+    network_mode: "service:node-a-docker"
+    command: ["python", "-u", "/lab/dns.py"]
+    environment:
+      TESSERA_LAB_BRIDGE_IP: ${TESSERA_LAB_BRIDGE_IP:-172.30.250.1}
+    volumes:
+      - ./dns.py:/lab/dns.py:ro
+    depends_on:
+      node-a-docker:
+        condition: service_healthy
+
+  node-b-docker:
+    image: docker:29-dind
+    privileged: true
+    command: ["--host=unix:///var/run/docker.sock", "--bip=${TESSERA_LAB_BRIDGE_IP:-172.30.250.1}/24", "--dns=${TESSERA_LAB_BRIDGE_IP:-172.30.250.1}"]
+    environment:
+      DOCKER_TLS_CERTDIR: ""
+    volumes:
+      - node-b-run:/var/run
+      - node-b-data:/var/lib/docker
+    healthcheck:
+      test: ["CMD", "docker", "info"]
+      interval: 3s
+      timeout: 2s
+      retries: 30
+
+  node-b:
+    image: tessera-lab-tessera:local
+    command: ["agent", "--url", "http://controller:7468", "--data", "/data", "--runtime", "docker", "--id", "lab-b"]
+    network_mode: "service:node-b-docker"
+    environment:
+      TESSERA_TOKEN: tessera-local-lab-token
+      DOCKER_HOST: unix:///var/run/docker.sock
+    volumes:
+      - node-b-run:/var/run
+      - node-b-state:/data
+    depends_on:
+      controller:
+        condition: service_healthy
+      node-b-docker:
+        condition: service_healthy
+      node-b-dns:
+        condition: service_started
+
+  node-b-dns:
+    image: python:3.13-alpine
+    network_mode: "service:node-b-docker"
+    command: ["python", "-u", "/lab/dns.py"]
+    environment:
+      TESSERA_LAB_BRIDGE_IP: ${TESSERA_LAB_BRIDGE_IP:-172.30.250.1}
+    volumes:
+      - ./dns.py:/lab/dns.py:ro
+    depends_on:
+      node-b-docker:
+        condition: service_healthy
+
+  k6:
+    image: grafana/k6:0.54.0
+    profiles: ["load"]
+    user: "0:0"
+    environment:
+      BASE_URL: http://controller:8088
+      SCENARIO: smoke
+    volumes:
+      - ./k6:/scripts:ro
+      - ./results:/results
+    entrypoint: ["k6"]
+    command: ["run", "/scripts/traffic.js"]
+
+  registry:
+    image: registry:3.1
+    profiles: ["services"]
+    ports:
+      - "127.0.0.1:5001:5000"
+    volumes:
+      - registry-data:/var/lib/registry
+
+  postgres:
+    image: postgres:17-alpine
+    profiles: ["services"]
+    environment:
+      POSTGRES_USER: lab
+      POSTGRES_PASSWORD: lab-only-password
+      POSTGRES_DB: lab
+    ports:
+      - "127.0.0.1:55432:5432"
+    volumes:
+      - postgres-data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U lab -d lab"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+
+  redis:
+    image: redis:7-alpine
+    profiles: ["services"]
+    ports:
+      - "127.0.0.1:16379:6379"
+    volumes:
+      - redis-data:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+
+  object-store:
+    image: alpine/minio:RELEASE.2025-10-15T17-29-55Z
+    profiles: ["services"]
+    user: "0:0"
+    command: ["server", "/data", "--console-address", ":9001"]
+    environment:
+      MINIO_ROOT_USER: lab
+      MINIO_ROOT_PASSWORD: lab-only-password
+    ports:
+      - "127.0.0.1:19000:9000"
+      - "127.0.0.1:19001:9001"
+    volumes:
+      - object-data:/data
+
+volumes:
+  controller-data:
+  node-a-run:
+  node-a-data:
+  node-a-state:
+  node-b-run:
+  node-b-data:
+  node-b-state:
+  registry-data:
+  postgres-data:
+  redis-data:
+  object-data:
