@@ -4,9 +4,11 @@ import (
 	"database/sql"
 	"encoding/json"
 	"fmt"
+	"io"
 	"net/url"
 	"os"
 	"path/filepath"
+	"strconv"
 	"time"
 
 	"tessera/internal/api"
@@ -453,6 +455,98 @@ func (s *Store) Backup(path string) error {
 	q := fmt.Sprintf("VACUUM INTO '%s'", escape(path))
 	_, err := s.db.Exec(q)
 	return err
+}
+
+func RestoreBackup(source, target string, minEpoch uint64) error {
+	if minEpoch == ^uint64(0) {
+		return fmt.Errorf("restore epoch leaves no room for promotion")
+	}
+	if _, err := os.Stat(target); err == nil {
+		return fmt.Errorf("restore target already exists: %s", target)
+	} else if !os.IsNotExist(err) {
+		return err
+	}
+	sourceURL := url.URL{Scheme: "file", Path: source, RawQuery: "mode=ro"}
+	reader, err := sql.Open("sqlite", sourceURL.String())
+	if err != nil {
+		return err
+	}
+	defer reader.Close()
+	var check string
+	if err := reader.QueryRow(`PRAGMA quick_check`).Scan(&check); err != nil {
+		return fmt.Errorf("invalid backup: %w", err)
+	}
+	if check != "ok" {
+		return fmt.Errorf("invalid backup: %s", check)
+	}
+	var epochText, token string
+	if err := reader.QueryRow(`SELECT value FROM meta WHERE key='epoch'`).Scan(&epochText); err != nil {
+		return fmt.Errorf("backup has no epoch: %w", err)
+	}
+	if err := reader.QueryRow(`SELECT value FROM meta WHERE key='token'`).Scan(&token); err != nil {
+		return fmt.Errorf("backup has no token: %w", err)
+	}
+	if token == "" {
+		return fmt.Errorf("backup has no token")
+	}
+	epoch, err := strconv.ParseUint(epochText, 10, 64)
+	if err != nil || epoch == ^uint64(0) {
+		return fmt.Errorf("invalid backup epoch %q", epochText)
+	}
+	epoch++
+	if minEpoch > epoch {
+		epoch = minEpoch
+	}
+	if err := os.MkdirAll(filepath.Dir(target), 0o700); err != nil {
+		return err
+	}
+	input, err := os.Open(source)
+	if err != nil {
+		return err
+	}
+	defer input.Close()
+	output, err := os.CreateTemp(filepath.Dir(target), ".tessera-restore-*.db")
+	if err != nil {
+		return err
+	}
+	temp := output.Name()
+	defer os.Remove(temp)
+	if err := output.Chmod(0o600); err != nil {
+		output.Close()
+		return err
+	}
+	if _, err := io.Copy(output, input); err != nil {
+		output.Close()
+		return err
+	}
+	if err := output.Sync(); err != nil {
+		output.Close()
+		return err
+	}
+	if err := output.Close(); err != nil {
+		return err
+	}
+	targetURL := url.URL{Scheme: "file", Path: temp, RawQuery: "_pragma=journal_mode(DELETE)"}
+	db, err := sql.Open("sqlite", targetURL.String())
+	if err != nil {
+		return err
+	}
+	db.SetMaxOpenConns(1)
+	if _, err := db.Exec(`INSERT INTO meta(key, value) VALUES('epoch', ?) ON CONFLICT(key) DO UPDATE SET value=excluded.value`, strconv.FormatUint(epoch, 10)); err != nil {
+		db.Close()
+		return err
+	}
+	if _, err := db.Exec(`INSERT INTO meta(key, value) VALUES('controller_id', '') ON CONFLICT(key) DO UPDATE SET value=''`); err != nil {
+		db.Close()
+		return err
+	}
+	if err := db.Close(); err != nil {
+		return err
+	}
+	if _, err := os.Stat(target); err == nil {
+		return fmt.Errorf("restore target already exists: %s", target)
+	}
+	return os.Rename(temp, target)
 }
 
 func (s *Store) putJSON(table, keyCol, key string, v any, generation int64) error {

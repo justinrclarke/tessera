@@ -215,6 +215,7 @@ func (s *Server) assignmentFrom(p schedule.Placement, now time.Time) (api.Assign
 		Ports:      app.Ports,
 		Resources:  app.Resources,
 		GPUs:       app.GPUs,
+		GPUDevices: p.GPUDevices,
 		Kind:       app.Kind,
 		Updated:    now,
 	}, nil

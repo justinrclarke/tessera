@@ -23,6 +23,7 @@ import (
 	"tessera/internal/controller"
 	"tessera/internal/discover"
 	"tessera/internal/drill"
+	"tessera/internal/k8sbridge"
 	"tessera/internal/k8simport"
 	"tessera/internal/mcp"
 	rt "tessera/internal/runtime"
@@ -77,6 +78,8 @@ func run(args []string) error {
 		return cmdDrill()
 	case "backup":
 		return cmdBackup(args[1:])
+	case "restore":
+		return cmdRestore(args[1:])
 	case "watchdog":
 		if len(args) < 3 || args[1] != "--" {
 			return fmt.Errorf("usage: tessera watchdog -- <args>")
@@ -97,7 +100,7 @@ One binary. Apps, jobs, routes, configs, secrets, and a policy.
 The controller places work, heals known failures, and can elect a new leader
 from a signed snapshot if the current one dies. Destructive actions stay proposed.
 
-  tessera up [--listen :7468] [--runtime auto|docker|ctr|fake]
+  tessera up [--listen :7468] [--runtime auto|docker|ctr|fake] [--labels KEY=VALUE,...]
   tessera apply -f app.yaml
   tessera get apps|nodes|assignments|actions|routes
   tessera confirm [id]
@@ -105,6 +108,8 @@ from a signed snapshot if the current one dies. Destructive actions stay propose
   tessera agent [--url http://controller:7468]
   tessera import -f deploy.yaml
   tessera mcp
+  tessera backup -o tessera-backup.db
+  tessera restore -f tessera-backup.db --data NEW_DIRECTORY
   tessera drill
 
 An agent that already has the token joins over mDNS. No IP required.
@@ -122,7 +127,12 @@ func cmdUp(args []string) error {
 	listen := fs.String("listen", "0.0.0.0:7468", "controller listen address")
 	data := fs.String("data", config.Dir(), "data directory")
 	runtimeName := fs.String("runtime", "auto", "container runtime: auto, docker, ctr, or fake")
+	labelsArg := fs.String("labels", "", "comma-separated node labels")
 	if err := fs.Parse(args); err != nil {
+		return err
+	}
+	labels, err := parseLabels(*labelsArg)
+	if err != nil {
 		return err
 	}
 	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
@@ -144,6 +154,7 @@ func cmdUp(args []string) error {
 		Client:  cl,
 		Runtime: rtm,
 		Addr:    advertiseHost(*listen),
+		Labels:  labels,
 	}
 	err = ag.Run(ctx)
 	if errors.Is(err, agent.ErrHalted) {
@@ -182,7 +193,12 @@ func cmdAgent(args []string) error {
 	id := fs.String("id", os.Getenv("TESSERA_NODE_ID"), "stable node ID")
 	data := fs.String("data", filepath.Join(config.Dir(), "agent"), "agent data directory")
 	runtimeName := fs.String("runtime", "auto", "container runtime")
+	labelsArg := fs.String("labels", "", "comma-separated node labels")
 	if err := fs.Parse(args); err != nil {
+		return err
+	}
+	labels, err := parseLabels(*labelsArg)
+	if err != nil {
 		return err
 	}
 	if *token == "" {
@@ -222,7 +238,7 @@ func cmdAgent(args []string) error {
 	if err != nil {
 		return fmt.Errorf("runtime: %w", err)
 	}
-	ag := &agent.Agent{ID: *id, DataDir: *data, Token: *token, URL: url, Client: client.New(url, *token), Runtime: rtm}
+	ag := &agent.Agent{ID: *id, DataDir: *data, Token: *token, URL: url, Client: client.New(url, *token), Runtime: rtm, Labels: labels}
 	err = ag.Run(ctx)
 	if ctx.Err() != nil || errors.Is(err, agent.ErrHalted) {
 		return nil
@@ -365,19 +381,33 @@ func cmdConfirm(args []string) error {
 
 func cmdAsk(args []string) error {
 	fs := flag.NewFlagSet("ask", flag.ContinueOnError)
+	kubernetes := fs.Bool("kubernetes", false, "inspect the current kubectl context")
+	kubeconfig := fs.String("kubeconfig", "", "kubeconfig for Kubernetes inspection")
+	kubeContext := fs.String("context", "", "Kubernetes context")
+	kubeNamespace := fs.String("namespace", "", "Kubernetes namespace; defaults to all")
 	if err := fs.Parse(args); err != nil {
 		return err
 	}
 	if fs.NArg() < 1 {
 		return fmt.Errorf("usage: tessera ask \"why is web down\"")
 	}
-	cl, err := openClient()
-	if err != nil {
-		return err
-	}
-	text, err := cl.Ask(context.Background(), strings.Join(fs.Args(), " "))
-	if err != nil {
-		return err
+	var text string
+	if *kubernetes || *kubeconfig != "" || *kubeContext != "" || *kubeNamespace != "" {
+		view, err := (&k8sbridge.Bridge{Kubeconfig: *kubeconfig, Context: *kubeContext, Namespace: *kubeNamespace}).Inspect(context.Background())
+		if err != nil {
+			return err
+		}
+		text = view.Explain(strings.Join(fs.Args(), " "))
+	} else {
+		cl, err := openClient()
+		if err != nil {
+			return err
+		}
+		var errAsk error
+		text, errAsk = cl.Ask(context.Background(), strings.Join(fs.Args(), " "))
+		if errAsk != nil {
+			return errAsk
+		}
 	}
 	note := ask.WithModel(context.Background(), text, ask.OpenAI{
 		URL: os.Getenv("TESSERA_LLM_URL"), Key: os.Getenv("TESSERA_LLM_KEY"), Model: os.Getenv("TESSERA_LLM_MODEL"),
@@ -390,8 +420,15 @@ func cmdMCP(args []string) error {
 	fs := flag.NewFlagSet("mcp", flag.ContinueOnError)
 	urlFlag := fs.String("url", "", "controller URL")
 	token := fs.String("token", "", "cluster token")
+	kubernetes := fs.Bool("kubernetes", false, "inspect the current kubectl context")
+	kubeconfig := fs.String("kubeconfig", "", "kubeconfig for Kubernetes inspection")
+	kubeContext := fs.String("context", "", "Kubernetes context")
+	kubeNamespace := fs.String("namespace", "", "Kubernetes namespace; defaults to all")
 	if err := fs.Parse(args); err != nil {
 		return err
+	}
+	if *kubernetes || *kubeconfig != "" || *kubeContext != "" || *kubeNamespace != "" {
+		return (&mcp.Server{Bridge: &k8sbridge.Bridge{Kubeconfig: *kubeconfig, Context: *kubeContext, Namespace: *kubeNamespace}}).Run(context.Background())
 	}
 	cl, err := openClient()
 	if err != nil && (*urlFlag == "" || *token == "") {
@@ -408,6 +445,8 @@ func cmdImport(args []string) error {
 	file := fs.String("f", "", "kubernetes yaml")
 	fromCluster := fs.Bool("from-cluster", false, "read the current kubectl context")
 	kubeconfig := fs.String("kubeconfig", "", "kubeconfig for --from-cluster")
+	kubeContext := fs.String("context", "", "Kubernetes context for --from-cluster")
+	kubeNamespace := fs.String("namespace", "", "Kubernetes namespace for --from-cluster; defaults to all")
 	dry := fs.Bool("dry-run", false, "print Tessera yaml, do not apply")
 	if err := fs.Parse(args); err != nil {
 		return err
@@ -416,7 +455,7 @@ func cmdImport(args []string) error {
 	var err error
 	switch {
 	case *fromCluster:
-		res, err = k8simport.FromCluster(*kubeconfig)
+		res, err = k8simport.FromClusterOptions(k8simport.ClusterOptions{Kubeconfig: *kubeconfig, Context: *kubeContext, Namespace: *kubeNamespace})
 	case *file != "":
 		body, rerr := readFile(*file)
 		if rerr != nil {
@@ -492,6 +531,20 @@ func cmdBackup(args []string) error {
 	}
 	defer st.Close()
 	return st.Backup(*out)
+}
+
+func cmdRestore(args []string) error {
+	fs := flag.NewFlagSet("restore", flag.ContinueOnError)
+	data := fs.String("data", config.Dir(), "new controller data directory")
+	file := fs.String("f", "", "backup database")
+	epoch := fs.Uint64("epoch", 0, "minimum new leader epoch")
+	if err := fs.Parse(args); err != nil {
+		return err
+	}
+	if *file == "" {
+		return fmt.Errorf("usage: tessera restore -f tessera-backup.db --data NEW_DIRECTORY")
+	}
+	return store.RestoreBackup(*file, filepath.Join(*data, "tessera.db"), *epoch)
 }
 
 func cmdInstall(args []string) error {
@@ -656,4 +709,24 @@ func advertiseHost(listen string) string {
 		return "127.0.0.1"
 	}
 	return host
+}
+
+func parseLabels(raw string) (map[string]string, error) {
+	if raw == "" {
+		return nil, nil
+	}
+	out := map[string]string{}
+	for _, item := range strings.Split(raw, ",") {
+		key, value, ok := strings.Cut(item, "=")
+		key = strings.TrimSpace(key)
+		value = strings.TrimSpace(value)
+		if !ok || key == "" || value == "" {
+			return nil, fmt.Errorf("invalid node label %q; use key=value", item)
+		}
+		if _, exists := out[key]; exists {
+			return nil, fmt.Errorf("duplicate node label %q", key)
+		}
+		out[key] = value
+	}
+	return out, nil
 }

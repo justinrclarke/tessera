@@ -1,5 +1,23 @@
 # Changelog
 
+## 0.6.0 (early work)
+
+- Agents accept host labels; Apps and Jobs can select them. Gang Jobs can require all workers to share one fabric label value. Checkpoint and coordinated gang moves remain open.
+
+## 0.5.0 (early work)
+
+- Agents now report NVIDIA GPU UUIDs, model names, and free memory from `nvidia-smi`. Apps and Models can request a GPU model and minimum free memory; placement reserves distinct devices and Docker passes their UUIDs to the NVIDIA Container Toolkit. The containerd runtime reports GPU workloads as unsupported. NVIDIA host acceptance remains open.
+
+## 0.4.0 (early work)
+
+- Added offline `tessera restore` for a database created by `tessera backup`. It verifies the database, uses a fresh controller identity and higher epoch, and refuses to overwrite an existing store. Live three-controller replication remains open.
+
+## 0.3.0 (in progress)
+
+- Added read-only Kubernetes inspection to `tessera ask` and the existing MCP tools through `kubectl`, with kubeconfig, context, and namespace selection.
+- Cluster import now includes StatefulSets and DaemonSets and reports unsupported built-in kinds, custom resource definitions, and webhook configurations. Multiple Service ports convert to distinct Routes.
+- Added a disposable kind-to-Tessera drill. It diagnosed an image pull failure, imported a Deployment and Service, and verified the App through a Tessera Route on macOS with OrbStack.
+
 ## 0.2.0 (local implementation verified)
 
 - A local Docker lab starts two isolated nodes and a sample Route, offers k6 load profiles and failure scenarios, and provides optional registry, PostgreSQL, Redis, and S3-compatible services. The sample workload reaches those services by name from either node. The clean-state drill verifies image transfer through the leader cache on failover and passed on macOS with OrbStack. Docker Desktop and native Linux host compatibility remains unverified.

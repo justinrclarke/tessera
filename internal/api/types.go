@@ -36,6 +36,13 @@ type Perf struct {
 	Disk   float64 `json:"disk" yaml:"disk"`
 }
 
+type GPU struct {
+	UUID        string `json:"uuid" yaml:"uuid"`
+	Model       string `json:"model" yaml:"model"`
+	MemoryTotal int64  `json:"memory_total" yaml:"memory_total"`
+	MemoryFree  int64  `json:"memory_free" yaml:"memory_free"`
+}
+
 type Port struct {
 	Container int    `json:"container" yaml:"container"`
 	Host      int    `json:"host,omitempty" yaml:"host,omitempty"`
@@ -57,12 +64,16 @@ type App struct {
 	Ports             []Port            `json:"ports,omitempty" yaml:"ports,omitempty"`
 	Resources         Resources         `json:"resources" yaml:"resources"`
 	GPUs              int               `json:"gpus,omitempty" yaml:"gpus,omitempty"`
+	GPUModel          string            `json:"gpu_model,omitempty" yaml:"gpu_model,omitempty"`
+	GPUMemory         int64             `json:"gpu_memory,omitempty" yaml:"gpu_memory,omitempty"`
 	Health            *Health           `json:"health,omitempty" yaml:"health,omitempty"`
 	Generation        int64             `json:"generation" yaml:"generation"`
 	HealthyGeneration int64             `json:"healthy_generation" yaml:"healthy_generation"`
 	SensitiveTo       string            `json:"sensitive_to,omitempty" yaml:"sensitive_to,omitempty"`
 	DependsOn         []string          `json:"depends_on,omitempty" yaml:"depends_on,omitempty"`
 	Gang              bool              `json:"gang,omitempty" yaml:"gang,omitempty"`
+	NodeLabels        map[string]string `json:"node_labels,omitempty" yaml:"node_labels,omitempty"`
+	GangFabric        string            `json:"gang_fabric,omitempty" yaml:"gang_fabric,omitempty"`
 	Configs           []string          `json:"configs,omitempty" yaml:"configs,omitempty"`
 	Secrets           []string          `json:"secrets,omitempty" yaml:"secrets,omitempty"`
 }
@@ -76,6 +87,7 @@ type Node struct {
 	Perf          Perf              `json:"perf" yaml:"perf"`
 	Score         float64           `json:"score" yaml:"score"`
 	GPUs          int               `json:"gpus" yaml:"gpus"`
+	GPUInventory  []GPU             `json:"gpu_inventory,omitempty" yaml:"gpu_inventory,omitempty"`
 	Labels        map[string]string `json:"labels,omitempty" yaml:"labels,omitempty"`
 	LastSeen      time.Time         `json:"last_seen" yaml:"last_seen"`
 	CordonedAt    time.Time         `json:"cordoned_at,omitempty" yaml:"cordoned_at,omitempty"`
@@ -105,6 +117,7 @@ type Assignment struct {
 	Ports      []Port            `json:"ports,omitempty" yaml:"ports,omitempty"`
 	Resources  Resources         `json:"resources" yaml:"resources"`
 	GPUs       int               `json:"gpus,omitempty" yaml:"gpus,omitempty"`
+	GPUDevices []string          `json:"gpu_devices,omitempty" yaml:"gpu_devices,omitempty"`
 	Kind       string            `json:"kind" yaml:"kind"`
 	Updated    time.Time         `json:"updated" yaml:"updated"`
 }
@@ -214,8 +227,16 @@ func (p Policy) Lease() time.Duration {
 }
 
 func (a App) ReleaseEqual(b App) bool {
-	if a.Image != b.Image || a.Kind != b.Kind || a.Gang != b.Gang || a.GPUs != b.GPUs || a.SensitiveTo != b.SensitiveTo {
+	if a.Image != b.Image || a.Kind != b.Kind || a.Gang != b.Gang || a.GangFabric != b.GangFabric || a.GPUs != b.GPUs || a.GPUModel != b.GPUModel || a.GPUMemory != b.GPUMemory || a.SensitiveTo != b.SensitiveTo {
 		return false
+	}
+	if len(a.NodeLabels) != len(b.NodeLabels) {
+		return false
+	}
+	for k, v := range a.NodeLabels {
+		if b.NodeLabels[k] != v {
+			return false
+		}
 	}
 	if len(a.Command) != len(b.Command) {
 		return false

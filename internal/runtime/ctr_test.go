@@ -169,6 +169,17 @@ func TestCTRMissing(t *testing.T) {
 	}
 }
 
+func TestCTRRejectsGPUWorkloadBeforeStarting(t *testing.T) {
+	c, cmds := scriptedCTR(t)
+	_, err := c.Start(context.Background(), Spec{Name: "tessera_gpu", Image: "model", GPUs: 1})
+	if err == nil || !strings.Contains(err.Error(), "NVIDIA Container Toolkit") {
+		t.Fatalf("unexpected GPU error: %v", err)
+	}
+	if len(*cmds) != 0 {
+		t.Fatalf("started unsupported workload: %v", *cmds)
+	}
+}
+
 func scriptedCTR(t *testing.T) (*CTR, *[][]string) {
 	t.Helper()
 	var cmds [][]string

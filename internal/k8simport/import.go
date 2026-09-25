@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"os/exec"
+	"sort"
 	"strings"
 
 	"gopkg.in/yaml.v3"
@@ -19,6 +20,13 @@ type Result struct {
 	YAML    string
 }
 
+type ClusterOptions struct {
+	Kubeconfig string
+	Context    string
+	Namespace  string
+	Run        func([]string) ([]byte, error)
+}
+
 func Convert(b []byte) (Result, error) {
 	docs, err := documents(b)
 	if err != nil {
@@ -26,6 +34,21 @@ func Convert(b []byte) (Result, error) {
 	}
 	var res Result
 	for _, doc := range docs {
+		kind := str(doc["kind"])
+		if kind == "Service" || kind == "Ingress" {
+			routes := routes(doc)
+			if len(routes) == 0 {
+				res.Skipped = append(res.Skipped, kind+"/"+metaName(doc)+": no ports")
+			}
+			for i := range routes {
+				r := routes[i]
+				if i > 0 {
+					r.Name = fmt.Sprintf("%s-%d", r.Name, r.Port)
+				}
+				res.Objects = append(res.Objects, api.Object{Kind: api.KindRoute, Route: &r})
+			}
+			continue
+		}
 		obj, skip, err := one(doc)
 		if err != nil {
 			return Result{}, err
@@ -47,16 +70,96 @@ func Convert(b []byte) (Result, error) {
 }
 
 func FromCluster(kubeconfig string) (Result, error) {
-	args := []string{"get", "deploy,svc,job,configmap,secret,ingress", "-A", "-o", "json"}
-	if kubeconfig != "" {
-		args = append([]string{"--kubeconfig", kubeconfig}, args...)
+	return FromClusterOptions(ClusterOptions{Kubeconfig: kubeconfig})
+}
+
+func FromClusterOptions(opts ClusterOptions) (Result, error) {
+	args := []string{"get", "deployments,statefulsets,daemonsets,jobs,services,ingresses,configmaps,secrets"}
+	if opts.Namespace == "" {
+		args = append(args, "-A")
+	} else {
+		args = append(args, "-n", opts.Namespace)
 	}
-	cmd := exec.Command("kubectl", args...)
-	out, err := cmd.CombinedOutput()
+	args = append(args, "-o", "json")
+	out, err := opts.command(args...)
 	if err != nil {
-		return Result{}, fmt.Errorf("kubectl: %w: %s", err, out)
+		return Result{}, err
 	}
-	return Convert(out)
+	res, err := Convert(out)
+	if err != nil {
+		return Result{}, err
+	}
+	allArgs := []string{"get", "all"}
+	if opts.Namespace == "" {
+		allArgs = append(allArgs, "-A")
+	} else {
+		allArgs = append(allArgs, "-n", opts.Namespace)
+	}
+	allArgs = append(allArgs, "-o", "json")
+	all, allErr := opts.command(allArgs...)
+	if allErr != nil {
+		res.Skipped = append(res.Skipped, "other Kubernetes kinds not inspected: "+allErr.Error())
+	} else if docs, decodeErr := documents(all); decodeErr != nil {
+		res.Skipped = append(res.Skipped, "other Kubernetes kinds not inspected: "+decodeErr.Error())
+	} else {
+		counts := map[string]int{}
+		for _, doc := range docs {
+			kind := str(doc["kind"])
+			switch kind {
+			case "Deployment", "StatefulSet", "DaemonSet", "Job", "Service", "Ingress", "ConfigMap", "Secret":
+			default:
+				counts[kind]++
+			}
+		}
+		var kinds []string
+		for kind := range counts {
+			kinds = append(kinds, kind)
+		}
+		sort.Strings(kinds)
+		for _, kind := range kinds {
+			res.Skipped = append(res.Skipped, fmt.Sprintf("%s: %d objects not converted", kind, counts[kind]))
+		}
+	}
+	unknown, err := opts.command("get", "customresourcedefinitions,mutatingwebhookconfigurations,validatingwebhookconfigurations", "-o", "json")
+	if err != nil {
+		res.Skipped = append(res.Skipped, "custom resources and webhooks not inspected: "+err.Error())
+		return res, nil
+	}
+	var body struct {
+		Items []struct {
+			Kind     string `json:"kind"`
+			Metadata struct {
+				Name string `json:"name"`
+			} `json:"metadata"`
+		} `json:"items"`
+	}
+	if err := json.Unmarshal(unknown, &body); err != nil {
+		res.Skipped = append(res.Skipped, "custom resources and webhooks not inspected: "+err.Error())
+		return res, nil
+	}
+	for _, item := range body.Items {
+		res.Skipped = append(res.Skipped, item.Kind+"/"+item.Metadata.Name+" (not converted)")
+	}
+	return res, nil
+}
+
+func (opts ClusterOptions) command(args ...string) ([]byte, error) {
+	flags := []string{"--request-timeout=10s"}
+	if opts.Kubeconfig != "" {
+		flags = append(flags, "--kubeconfig", opts.Kubeconfig)
+	}
+	if opts.Context != "" {
+		flags = append(flags, "--context", opts.Context)
+	}
+	flags = append(flags, args...)
+	if opts.Run != nil {
+		return opts.Run(flags)
+	}
+	out, err := exec.Command("kubectl", flags...).CombinedOutput()
+	if err != nil {
+		return nil, fmt.Errorf("kubectl %s: %w: %s", strings.Join(args, " "), err, strings.TrimSpace(string(out)))
+	}
+	return out, nil
 }
 
 func documents(b []byte) ([]map[string]any, error) {
@@ -125,13 +228,6 @@ func one(doc map[string]any) (api.Object, string, error) {
 	case "Job":
 		app, err := workload(doc, api.KindJob)
 		return api.Object{Kind: app.Kind, App: &app}, "", err
-	case "Service", "Ingress":
-		routes := routes(doc)
-		if len(routes) == 0 {
-			return api.Object{}, kind + " " + metaName(doc) + ": no ports", nil
-		}
-		r := routes[0]
-		return api.Object{Kind: api.KindRoute, Route: &r}, "", nil
 	case "ConfigMap":
 		c := api.Config{Kind: api.KindConfig, Name: metaName(doc), Data: stringMap(doc["data"])}
 		return api.Object{Kind: api.KindConfig, Config: &c}, "", nil

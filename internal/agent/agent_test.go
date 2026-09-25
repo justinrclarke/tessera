@@ -49,6 +49,29 @@ func TestPerfRecordedOnceThenHourly(t *testing.T) {
 	}
 }
 
+func TestGPUInventoryRefreshesAndReports(t *testing.T) {
+	cur := time.Now()
+	calls := 0
+	ag := &Agent{DataDir: t.TempDir(), Now: func() time.Time { return cur }, GPUProbe: func(context.Context) ([]api.GPU, error) {
+		calls++
+		return []api.GPU{{UUID: "gpu-one", Model: "NVIDIA H100", MemoryFree: 20 << 30}}, nil
+	}}
+	first := ag.reportHost()
+	if first.GPUs != 1 || len(first.GPUInventory) != 1 || calls != 1 {
+		t.Fatalf("first report %+v, calls %d", first, calls)
+	}
+	cur = cur.Add(10 * time.Second)
+	_ = ag.reportHost()
+	if calls != 1 {
+		t.Fatalf("probed %d times inside refresh window", calls)
+	}
+	cur = cur.Add(30 * time.Second)
+	_ = ag.reportHost()
+	if calls != 2 {
+		t.Fatalf("did not refresh: %d calls", calls)
+	}
+}
+
 func TestRestartRemovesExitedContainer(t *testing.T) {
 	ctx := context.Background()
 	fake := runtime.NewFake()

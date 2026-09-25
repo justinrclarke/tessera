@@ -43,6 +43,7 @@ func Run() ([]Report, error) {
 		{"certificate renews at half life", renewCert},
 		{"route follows a move", routeFollowsMove},
 		{"cached image skips the registry", cachedImage},
+		{"backup restores onto a new leader", backupRestore},
 		{"confirm wipe clears the node", confirmWipe},
 		{"confirm reimage rejoins", confirmReimage},
 		{"confirm delete removes the app", confirmDelete},
@@ -61,6 +62,65 @@ func Run() ([]Report, error) {
 		}
 	}
 	return out, nil
+}
+
+func backupRestore() error {
+	srv, cl, cleanup := boot(time.Now())
+	defer func() {
+		if cleanup != nil {
+			cleanup()
+		}
+	}()
+	if err := cl.Apply(context.Background(), []byte("kind: App\nname: restored\nimage: nginx\n")); err != nil {
+		return err
+	}
+	root := tDir()
+	if err := os.MkdirAll(root, 0o700); err != nil {
+		return err
+	}
+	defer os.RemoveAll(root)
+	backup := filepath.Join(root, "backup.db")
+	if err := srv.Store.Backup(backup); err != nil {
+		return err
+	}
+	oldID, oldEpoch := srv.ID, srv.Epoch()
+	cleanup()
+	cleanup = nil
+	dir := filepath.Join(root, "replacement")
+	if err := store.RestoreBackup(backup, filepath.Join(dir, "tessera.db"), 0); err != nil {
+		return err
+	}
+	st, err := store.Open(filepath.Join(dir, "tessera.db"))
+	if err != nil {
+		return err
+	}
+	defer st.Close()
+	next, err := controller.New(st, controller.Config{DataDir: dir})
+	if err != nil {
+		return err
+	}
+	if next.ID == oldID || next.Epoch() <= oldEpoch || next.Token != "drill-token" {
+		return fmt.Errorf("restored identity id=%s epoch=%d token=%s", next.ID, next.Epoch(), next.Token)
+	}
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		return err
+	}
+	defer next.Close()
+	go func() { _ = next.Serve(context.Background(), ln) }()
+	clientNext := client.New("http://"+ln.Addr().String(), "drill-token")
+	deadline := time.Now().Add(2 * time.Second)
+	for time.Now().Before(deadline) {
+		apps, err := clientNext.ListApps(context.Background())
+		if err == nil {
+			if len(apps) != 1 || apps[0].Name != "restored" {
+				return fmt.Errorf("restored apps %+v", apps)
+			}
+			return nil
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	return fmt.Errorf("replacement leader did not serve restored app")
 }
 
 func placeAndRun() error {

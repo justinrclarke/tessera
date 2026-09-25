@@ -48,7 +48,11 @@ Kinds: App, Job, Model, Route, Config, Secret, Policy. Separate documents with `
 
 A Job runs to completion. Set `gang: true` when every replica must land together or not at all. A Model is an App that prefers GPU nodes. A Route is a stable port on the controller. When a move starts a replacement and that replacement is running, the route cuts over. The client keeps the same address.
 
+Start an agent with `--labels fabric=ethernet-a,storage=shared` to describe its host. An App or Job can require `node_labels: {storage: shared}`. For a gang Job, `gang_fabric: fabric` keeps all workers on nodes with the same `fabric` value. Labels describe a real link or shared mount; Tessera does not create either one.
+
 `cpu` accepts Kubernetes-style quantities (`100m`, `1`). `memory` accepts `128Mi`, `1Gi`, or a byte count.
+
+For an NVIDIA model server, set `kind: Model`, `gpus: 1`, and optionally `gpu_model: NVIDIA H100` and `gpu_memory: 20Gi`. The agent reads model and free memory through `nvidia-smi`; Tessera reserves a GPU UUID for each replica and asks Docker to expose that device. The host needs an NVIDIA driver and the NVIDIA Container Toolkit. GPU memory is checked at placement time and is not a container memory limit. The `ctr` runtime currently rejects GPU workloads. Attach a Route to the Model name as you would for an App.
 
 A release change (image, command, env, configs, secrets) bumps generation. Replica-only changes do not. If the new generation fails and an older one was healthy, Tessera rolls back.
 
@@ -70,16 +74,22 @@ If the leader's lease expires, a node holding the snapshot can promote itself. A
 
 ## Kubernetes
 
-`tessera import -f deploy.yaml` converts Deployment, StatefulSet, DaemonSet, Job, Service, Ingress, ConfigMap, and Secret. Other kinds are printed as skipped. `--from-cluster` shells out to `kubectl`. This is a conversion, not a Kubernetes API.
+`tessera import -f deploy.yaml` converts Deployment, StatefulSet, DaemonSet, Job, Service, Ingress, ConfigMap, and Secret. Other kinds are printed as skipped. `--from-cluster` shells out to `kubectl`, includes StatefulSets and DaemonSets, and reports unsupported kinds found by `kubectl get all`, custom resource definitions, and webhook configurations. It reports an inspection warning if access to either inventory is denied. Custom resource instances are not converted. This is a conversion, not a Kubernetes API.
 
 ```
 tessera import -f deploy.yaml --dry-run
-tessera import --from-cluster
+tessera import --from-cluster --kubeconfig /path/to/kubeconfig --namespace demo --dry-run
+tessera ask --kubeconfig /path/to/kubeconfig --namespace demo "why is web down?"
+tessera mcp --kubeconfig /path/to/kubeconfig --namespace demo
 ```
+
+`ask` and `mcp` use the same read-only tool names against the selected Kubernetes cluster. They inspect Deployments, StatefulSets, DaemonSets, Jobs, Pods, nodes, and warning events. Use `--context NAME` to select a context, or `--kubernetes` to use the current `kubectl` context. These flags select the Kubernetes bridge instead of the Tessera controller. Workloads in different namespaces need `namespace/name` for `get_app` and `logs`. The bridge does not mutate Kubernetes objects or record Tessera actions. Your kubeconfig needs read access to the inspected resources.
+
+`sh lab/kubernetes.sh` runs the 0.3.0 handoff drill with an isolated kind cluster and kubeconfig. It diagnoses a failed image pull, converts a Deployment and Service, applies them to the local Tessera lab, checks the resulting Route, and removes its test clusters. It requires `kind`, `kubectl`, Docker Compose, Go, and `curl`, and refuses to replace an already running Tessera lab.
 
 ## Boot and backup
 
-`tessera install` writes a launchd agent or a systemd user unit. It does not load it. `tessera backup -o tessera-backup.db` copies the SQLite store.
+`tessera install` writes a launchd agent or a systemd user unit. It does not load it. `tessera backup -o tessera-backup.db` copies the SQLite store. For an offline replacement controller, run `tessera restore -f tessera-backup.db --data NEW_DIRECTORY` before starting it. Restore checks the backup, refuses an existing database, preserves the cluster token and data, assigns a fresh controller identity, and advances the leader epoch. `--epoch N` sets a higher minimum epoch when agents have seen a later leader. Stop or fence the previous leader before starting the replacement; image cache files are separate from the database backup.
 
 `tessera up` restarts itself through a watchdog unless you pass `--watched` or set `TESSERA_WATCHED=1`. A clean exit is not restarted. A child that dies within 500ms is not restarted either.
 

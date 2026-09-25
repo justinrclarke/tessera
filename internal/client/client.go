@@ -26,15 +26,16 @@ func New(base, token string) *Client {
 }
 
 type RegisterRequest struct {
-	ID        string            `json:"id"`
-	Addr      string            `json:"addr"`
-	Capacity  api.Resources     `json:"capacity"`
-	Free      api.Resources     `json:"free"`
-	Perf      api.Perf          `json:"perf"`
-	GPUs      int               `json:"gpus"`
-	DiskFree  int64             `json:"disk_free"`
-	DiskTotal int64             `json:"disk_total"`
-	Labels    map[string]string `json:"labels,omitempty"`
+	ID           string            `json:"id"`
+	Addr         string            `json:"addr"`
+	Capacity     api.Resources     `json:"capacity"`
+	Free         api.Resources     `json:"free"`
+	Perf         api.Perf          `json:"perf"`
+	GPUs         int               `json:"gpus"`
+	GPUInventory []api.GPU         `json:"gpu_inventory,omitempty"`
+	DiskFree     int64             `json:"disk_free"`
+	DiskTotal    int64             `json:"disk_total"`
+	Labels       map[string]string `json:"labels,omitempty"`
 }
 
 type RegisterResponse struct {
@@ -47,13 +48,14 @@ type RegisterResponse struct {
 }
 
 type HeartbeatRequest struct {
-	Addr      string        `json:"addr"`
-	Capacity  api.Resources `json:"capacity"`
-	Free      api.Resources `json:"free"`
-	Perf      api.Perf      `json:"perf"`
-	GPUs      int           `json:"gpus"`
-	DiskFree  int64         `json:"disk_free"`
-	DiskTotal int64         `json:"disk_total"`
+	Addr         string        `json:"addr"`
+	Capacity     api.Resources `json:"capacity"`
+	Free         api.Resources `json:"free"`
+	Perf         api.Perf      `json:"perf"`
+	GPUs         int           `json:"gpus"`
+	GPUInventory []api.GPU     `json:"gpu_inventory,omitempty"`
+	DiskFree     int64         `json:"disk_free"`
+	DiskTotal    int64         `json:"disk_total"`
 }
 
 type HeartbeatResponse struct {

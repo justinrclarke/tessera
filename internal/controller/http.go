@@ -192,7 +192,7 @@ func (s *Server) handleRegister(w http.ResponseWriter, r *http.Request) {
 	}
 	n := api.Node{
 		ID: req.ID, Addr: req.Addr, Status: api.NodeReady,
-		Capacity: req.Capacity, Free: req.Free, Perf: req.Perf, Score: req.Perf.CPU, GPUs: req.GPUs,
+		Capacity: req.Capacity, Free: req.Free, Perf: req.Perf, Score: req.Perf.CPU, GPUs: req.GPUs, GPUInventory: req.GPUInventory,
 		Labels: req.Labels, LastSeen: now, DiskFree: req.DiskFree, DiskTotal: req.DiskTotal,
 		CertNotBefore: cert.NotBefore, CertNotAfter: cert.NotAfter, Epoch: s.Epoch(),
 	}
@@ -236,6 +236,7 @@ func (s *Server) handleHeartbeat(w http.ResponseWriter, r *http.Request) {
 	n.Perf = req.Perf
 	n.Score = req.Perf.CPU
 	n.GPUs = req.GPUs
+	n.GPUInventory = req.GPUInventory
 	n.DiskFree = req.DiskFree
 	n.DiskTotal = req.DiskTotal
 	resp := client.HeartbeatResponse{Epoch: s.epoch, LeaderID: s.ID, Expires: s.expires, Leading: s.leading}

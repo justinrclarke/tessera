@@ -1,6 +1,7 @@
 package store
 
 import (
+	"os"
 	"path/filepath"
 	"testing"
 	"time"
@@ -72,6 +73,61 @@ func TestBackup(t *testing.T) {
 	v, err := s2.Meta("k")
 	if err != nil || v != "v" {
 		t.Fatalf("%q %v", v, err)
+	}
+}
+
+func TestRestoreBackupAdvancesEpochAndChangesIdentity(t *testing.T) {
+	s := open(t)
+	for key, value := range map[string]string{"token": "shared-token", "epoch": "7", "controller_id": "old-leader"} {
+		if err := s.SetMeta(key, value); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := s.PutApp(api.App{Kind: api.KindApp, Name: "web", Image: "nginx:1", Replicas: 1}); err != nil {
+		t.Fatal(err)
+	}
+	backup := filepath.Join(t.TempDir(), "backup.db")
+	if err := s.Backup(backup); err != nil {
+		t.Fatal(err)
+	}
+	restored := filepath.Join(t.TempDir(), "new", "tessera.db")
+	if err := RestoreBackup(backup, restored, 12); err != nil {
+		t.Fatal(err)
+	}
+	if err := RestoreBackup(backup, restored, 0); err == nil {
+		t.Fatal("restore overwrote an existing target")
+	}
+	next, err := Open(restored)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer next.Close()
+	for key, want := range map[string]string{"token": "shared-token", "epoch": "12", "controller_id": ""} {
+		got, err := next.Meta(key)
+		if err != nil || got != want {
+			t.Fatalf("%s=%q, want %q: %v", key, got, want, err)
+		}
+	}
+	if app, err := next.GetApp("web"); err != nil || app.Image != "nginx:1" {
+		t.Fatalf("app %+v: %v", app, err)
+	}
+	info, err := os.Stat(restored)
+	if err != nil || info.Mode().Perm() != 0o600 {
+		t.Fatalf("restored mode: %v %v", info, err)
+	}
+}
+
+func TestRestoreBackupRejectsCorruptSource(t *testing.T) {
+	source := filepath.Join(t.TempDir(), "bad.db")
+	if err := os.WriteFile(source, []byte("not SQLite"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	target := filepath.Join(t.TempDir(), "tessera.db")
+	if err := RestoreBackup(source, target, 0); err == nil {
+		t.Fatal("accepted corrupt backup")
+	}
+	if _, err := os.Stat(target); !os.IsNotExist(err) {
+		t.Fatalf("target exists after failed restore: %v", err)
 	}
 }
 

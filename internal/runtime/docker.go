@@ -64,9 +64,12 @@ func (d *Docker) Start(ctx context.Context, spec Spec) (Container, error) {
 		hostConfig["NanoCPUs"] = spec.Resources.CPU * 1_000_000
 	}
 	if spec.GPUs > 0 {
-		hostConfig["DeviceRequests"] = []map[string]any{{
-			"Count": spec.GPUs, "Capabilities": [][]string{{"gpu"}},
-		}}
+		request := map[string]any{"Count": spec.GPUs, "Capabilities": [][]string{{"gpu"}}}
+		if len(spec.GPUDevices) > 0 {
+			request["Count"] = 0
+			request["DeviceIDs"] = spec.GPUDevices
+		}
+		hostConfig["DeviceRequests"] = []map[string]any{request}
 	}
 	body["HostConfig"] = hostConfig
 	raw, _ := json.Marshal(body)

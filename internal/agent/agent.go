@@ -17,6 +17,7 @@ import (
 	"tessera/internal/client"
 	"tessera/internal/controller"
 	"tessera/internal/discover"
+	"tessera/internal/gpu"
 	"tessera/internal/host"
 	"tessera/internal/runtime"
 	"tessera/internal/store"
@@ -37,6 +38,8 @@ type Agent struct {
 	Others      int
 	PeerIDs     []string
 	Reexec      func() error
+	GPUProbe    func(context.Context) ([]api.GPU, error)
+	Labels      map[string]string
 
 	maxEpoch  uint64
 	snapIndex uint64
@@ -45,6 +48,8 @@ type Agent struct {
 	promoted  *controller.Server
 	perfAt    time.Time
 	perfScore api.Perf
+	gpuAt     time.Time
+	gpuItems  []api.GPU
 }
 
 type diskCache struct {
@@ -277,7 +282,7 @@ func (a *Agent) converge(ctx context.Context, desired []api.Assignment, live boo
 		}
 		a.ensureImage(ctx, d.Image)
 		started, err := a.Runtime.Start(ctx, runtime.Spec{
-			Name: name, Image: d.Image, Command: d.Command, Env: d.Env, Ports: d.Ports, Resources: d.Resources, GPUs: d.GPUs,
+			Name: name, Image: d.Image, Command: d.Command, Env: d.Env, Ports: d.Ports, Resources: d.Resources, GPUs: d.GPUs, GPUDevices: d.GPUDevices,
 		})
 		if err != nil {
 			reason := err.Error()
@@ -326,8 +331,9 @@ func (a *Agent) ensureRegistered(ctx context.Context) error {
 			a.ID = "node-" + api.NewID()
 		}
 	}
+	items := a.gpuInventory()
 	_, err := a.Client.Register(ctx, client.RegisterRequest{
-		ID: a.ID, Addr: a.addr(), Capacity: a.capacity(), Free: a.free(), Perf: a.perf(), DiskFree: a.diskFree(), DiskTotal: a.diskTotal(),
+		ID: a.ID, Addr: a.addr(), Capacity: a.capacity(), Free: a.free(), Perf: a.perf(), GPUs: len(items), GPUInventory: items, DiskFree: a.diskFree(), DiskTotal: a.diskTotal(), Labels: a.Labels,
 	})
 	return err
 }
@@ -445,9 +451,29 @@ func (a *Agent) max() int {
 
 func (a *Agent) reportHost() client.HeartbeatRequest {
 	cap, free, diskTotal, diskFree := host.Resources(a.DataDir)
+	items := a.gpuInventory()
 	return client.HeartbeatRequest{
-		Addr: a.addr(), Capacity: cap, Free: free, Perf: a.perf(), DiskFree: diskFree, DiskTotal: diskTotal,
+		Addr: a.addr(), Capacity: cap, Free: free, Perf: a.perf(), GPUs: len(items), GPUInventory: items, DiskFree: diskFree, DiskTotal: diskTotal,
 	}
+}
+
+func (a *Agent) gpuInventory() []api.GPU {
+	if !a.gpuAt.IsZero() && a.now().Sub(a.gpuAt) < 30*time.Second {
+		return a.gpuItems
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+	probe := a.GPUProbe
+	if probe == nil {
+		probe = func(ctx context.Context) ([]api.GPU, error) { return gpu.Detect(ctx, nil) }
+	}
+	items, err := probe(ctx)
+	if err != nil {
+		items = nil
+	}
+	a.gpuItems = items
+	a.gpuAt = a.now()
+	return items
 }
 
 func (a *Agent) capacity() api.Resources {
