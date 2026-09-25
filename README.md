@@ -56,6 +56,25 @@ For an NVIDIA model server, set `kind: Model`, `gpus: 1`, and optionally `gpu_mo
 
 A release change (image, command, env, configs, secrets) bumps generation. Replica-only changes do not. If the new generation fails and an older one was healthy, Tessera rolls back.
 
+An App can include a `build` stanza instead of an `image`. `tessera apply -f app.yaml` builds it with the local Docker CLI before applying the resulting image. The build file names a base image, optional `apk` or `apt` packages, a process command, and a repository. Tessera copies the selected context into `/app`. With `push: true`, Docker uses credentials already configured on the operator's machine and Tessera applies the registry digest. Without push, it applies a local image-ID tag, which is useful only when the controller and nodes can obtain that image through their local runtime or Tessera's image cache.
+
+```yaml
+kind: App
+name: web
+build:
+  base: python:3.13-alpine
+  repository: registry.example.com/team/web
+  context: ./web
+  package_manager: apk
+  packages: [curl]
+  command: [python, app.py]
+  push: true
+ports:
+  - container: 8080
+```
+
+Set `push: false` to keep the image local. The pushed App image is pinned to the digest reported by the registry. Changes to the base tag or package repository between builds can produce different image IDs; pin the base image and package versions when repeatability matters.
+
 ## What it does on its own
 
 The agent heartbeats. After 3 seconds a node is suspect. After 10 seconds it is dead and its work is placed elsewhere. Crash loops restart up to 3 times, then move. A bad release rolls back. A full disk is pruned. A certificate past half its life is renewed. A node that keeps failing workloads is cordoned, then uncordoned after the move cooldown if heartbeats are fresh.
@@ -92,6 +111,12 @@ tessera mcp --kubeconfig /path/to/kubeconfig --namespace demo
 `tessera install` writes a launchd agent or a systemd user unit. It does not load it. `tessera backup -o tessera-backup.db` copies the SQLite store. For an offline replacement controller, run `tessera restore -f tessera-backup.db --data NEW_DIRECTORY` before starting it. Restore checks the backup, refuses an existing database, preserves the cluster token and data, assigns a fresh controller identity, and advances the leader epoch. `--epoch N` sets a higher minimum epoch when agents have seen a later leader. Stop or fence the previous leader before starting the replacement; image cache files are separate from the database backup.
 
 `tessera up` restarts itself through a watchdog unless you pass `--watched` or set `TESSERA_WATCHED=1`. A clean exit is not restarted. A child that dies within 500ms is not restarted either.
+
+## Cloud inventory
+
+`tessera cloud inventory --provider aws --region us-east-1`, `--provider gcp --project PROJECT`, or `--provider azure --subscription SUBSCRIPTION` reads VM lists through the installed AWS, gcloud, or Azure CLI and its existing login. This is read-only discovery. It does not create VMs or make them Tessera Nodes; an instance becomes a Node when its Tessera agent joins with the cluster token. Cloud inventory adapters are covered by scripted local tests, while real account validation remains open.
+
+`tessera infra plan -f desired.yaml [--state current.json]` previews a file with `networks`, `machines`, and `apps`. The optional state file is a local JSON fixture with the same resource names and `owned` flags; without it, the planner treats every desired resource as missing. This preview makes no cloud calls. It orders network, machine, and App changes, produces a stable generation hash, and marks changes to networks or machines and removal of owned resources as `confirm`. Adopted resources absent from the desired file are left alone. Cloud backed state discovery and `infra apply` are still planned.
 
 ## Check
 

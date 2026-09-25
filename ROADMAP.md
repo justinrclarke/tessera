@@ -103,6 +103,8 @@ Implementation gate: define a checkpoint contract with a shared URI, a save trig
 
 Build an image or package for a specific stack, and publish it so other people can pull it. Depends on the 0.2.0 cache. That cache is not the public registry.
 
+The first OCI image path is implemented for App manifests with a `build` stanza. `tessera apply` creates a Dockerfile from the selected base, package manager, packages, source context, and process; tags the local image by its image ID; and optionally pushes it, applying the digest returned by the registry. A disposable local registry drill built, pushed, removed the local copy, pulled, and ran that digest on OrbStack. An isolated CLI drill also built and applied an App to a temporary Tessera controller. Package artifacts, a second-cluster pull drill, and rollback through a published digest remain open. The build runs where the CLI is invoked and requires a working Docker CLI.
+
 - A stack file names the base, the packages, and the process that should be running. Apply it the same way as an App.
 - Tessera builds it. The result is an OCI image or a package, not a container that exists only on one node.
 - Publish to a public registry the author names. Another cluster pulls that name. There is no private copy step.
@@ -113,6 +115,8 @@ Implementation gate: accept a build stanza on an App manifest while keeping App 
 ## 0.8.0
 
 Use the cloud account you already have. AWS, GCP, and Azure are first. Others follow the same provider interface. A cloud VM is a Node. Do not build this before a LAN node is boring.
+
+The read-only inventory slice is implemented: `tessera cloud inventory` normalizes VM lists from the installed AWS, gcloud, and Azure CLIs, using their existing credentials. Scripted local tests cover all three JSON responses. Provisioning, ownership tracking, adoption, and live account drills remain open. No cloud account was accessed during this work.
 
 - Placement, healing, and moves do not grow a second scheduler.
 - Bring your credentials. Tessera does not become the account.
@@ -125,6 +129,8 @@ Implementation gate: use one provider interface for discover, create, inspect, a
 ## 0.9.0
 
 Describe the infrastructure you want. Tessera creates it and keeps it there. This waits on 0.8.0. There is no cloud to reconcile before that.
+
+The pure planning slice is implemented: `tessera infra plan` reads networks, machines, and Apps, compares them with an optional local state snapshot, and prints a stable generation and ordered actions. It proposes potentially destructive changes for confirmation and never proposes deletion of an adopted resource. This is a local preview only. Cloud state discovery, persistent ownership, and apply/reconcile remain open until 0.8.0 provisioning exists.
 
 - One file for networks, machines, and Apps. Apply it the same way as an App.
 - The controller reconciles that file against the cloud account: create what is missing, leave what already matches, and show what it will not delete without confirmation.

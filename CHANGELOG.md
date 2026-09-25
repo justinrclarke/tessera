@@ -1,5 +1,17 @@
 # Changelog
 
+## 0.9.0 (early work)
+
+- Added a pure infrastructure planner for networks, machines, and Apps. It shows stable generations, orders create actions by dependency, and proposes destructive changes for confirmation. The CLI currently compares with a local state file; no cloud apply path exists yet.
+
+## 0.8.0 (early work)
+
+- Added read-only VM inventory through the locally installed AWS, gcloud, and Azure CLIs, with scripted tests for all three providers. Provisioning and live account validation remain open.
+
+## 0.7.0 (early work)
+
+- An App build stanza now creates an OCI image during `tessera apply`. It can install `apk` or `apt` packages, copy a source context, and set the process. Local images use an image-ID tag; published images use a registry digest. A disposable local registry push/pull drill passed on OrbStack. Package artifacts and cross-cluster acceptance remain open.
+
 ## 0.6.0 (early work)
 
 - Agents accept host labels; Apps and Jobs can select them. Gang Jobs can require all workers to share one fabric label value. Checkpoint and coordinated gang moves remain open.

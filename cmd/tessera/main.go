@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"flag"
 	"fmt"
@@ -19,14 +20,17 @@ import (
 	"tessera/internal/api"
 	"tessera/internal/ask"
 	"tessera/internal/client"
+	"tessera/internal/cloud"
 	"tessera/internal/config"
 	"tessera/internal/controller"
 	"tessera/internal/discover"
 	"tessera/internal/drill"
+	"tessera/internal/infra"
 	"tessera/internal/k8sbridge"
 	"tessera/internal/k8simport"
 	"tessera/internal/mcp"
 	rt "tessera/internal/runtime"
+	"tessera/internal/stackbuild"
 	"tessera/internal/store"
 	"tessera/internal/watchdog"
 
@@ -80,6 +84,10 @@ func run(args []string) error {
 		return cmdBackup(args[1:])
 	case "restore":
 		return cmdRestore(args[1:])
+	case "cloud":
+		return cmdCloud(args[1:])
+	case "infra":
+		return cmdInfra(args[1:])
 	case "watchdog":
 		if len(args) < 3 || args[1] != "--" {
 			return fmt.Errorf("usage: tessera watchdog -- <args>")
@@ -110,6 +118,8 @@ from a signed snapshot if the current one dies. Destructive actions stay propose
   tessera mcp
   tessera backup -o tessera-backup.db
   tessera restore -f tessera-backup.db --data NEW_DIRECTORY
+  tessera cloud inventory --provider aws|gcp|azure
+  tessera infra plan -f desired.yaml [--state current.json]
   tessera drill
 
 An agent that already has the token joins over mDNS. No IP required.
@@ -263,7 +273,85 @@ func cmdApply(args []string) error {
 	if err != nil {
 		return err
 	}
+	body, images, err := stackbuild.Prepare(context.Background(), *file, body, nil)
+	if err != nil {
+		return err
+	}
+	for _, image := range images {
+		fmt.Fprintf(os.Stderr, "built %s\n", image)
+	}
 	return cl.Apply(context.Background(), body)
+}
+
+func cmdCloud(args []string) error {
+	if len(args) == 0 || args[0] != "inventory" {
+		return fmt.Errorf("usage: tessera cloud inventory --provider aws|gcp|azure")
+	}
+	fs := flag.NewFlagSet("cloud inventory", flag.ContinueOnError)
+	provider := fs.String("provider", "", "aws, gcp, or azure")
+	region := fs.String("region", "", "AWS region")
+	project := fs.String("project", "", "GCP project")
+	subscription := fs.String("subscription", "", "Azure subscription")
+	if err := fs.Parse(args[1:]); err != nil {
+		return err
+	}
+	if fs.NArg() != 0 {
+		return fmt.Errorf("unexpected cloud inventory arguments: %v", fs.Args())
+	}
+	items, err := (cloud.Inventory{Provider: *provider, Region: *region, Project: *project, Subscription: *subscription}).List(context.Background())
+	if err != nil {
+		return err
+	}
+	fmt.Printf("%-7s %-50s %-24s %-16s %-20s %s\n", "CLOUD", "ID", "NAME", "LOCATION", "TYPE", "STATE")
+	for _, item := range items {
+		fmt.Printf("%-7s %-50s %-24s %-16s %-20s %s\n", item.Provider, item.ID, item.Name, item.Region, item.Type, item.State)
+	}
+	return nil
+}
+
+func cmdInfra(args []string) error {
+	if len(args) == 0 || args[0] != "plan" {
+		return fmt.Errorf("usage: tessera infra plan -f desired.yaml [--state current.json]")
+	}
+	fs := flag.NewFlagSet("infra plan", flag.ContinueOnError)
+	file := fs.String("f", "", "desired infrastructure YAML")
+	stateFile := fs.String("state", "", "optional local current-state JSON")
+	if err := fs.Parse(args[1:]); err != nil {
+		return err
+	}
+	if *file == "" || fs.NArg() != 0 {
+		return fmt.Errorf("usage: tessera infra plan -f desired.yaml [--state current.json]")
+	}
+	body, err := readFile(*file)
+	if err != nil {
+		return err
+	}
+	desired, err := infra.Parse(body)
+	if err != nil {
+		return err
+	}
+	var state infra.State
+	if *stateFile != "" {
+		body, err := os.ReadFile(*stateFile)
+		if err != nil {
+			return err
+		}
+		if err := json.Unmarshal(body, &state); err != nil {
+			return err
+		}
+	}
+	plan, err := infra.Plan(desired, state)
+	if err != nil {
+		return err
+	}
+	fmt.Printf("generation %s\n", plan.Generation[:16])
+	if len(plan.Actions) == 0 {
+		fmt.Println("no changes")
+	}
+	for _, action := range plan.Actions {
+		fmt.Printf("%-8s %-8s %-20s %s\n", action.Operation, action.Kind, action.Name, action.Reason)
+	}
+	return nil
 }
 
 func cmdGet(args []string) error {
