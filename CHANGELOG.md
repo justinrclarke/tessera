@@ -1,5 +1,11 @@
 # Changelog
 
+## CLI completion (unreleased)
+
+- `tessera install` now installs the binary and starts a user service running `tessera agent` on macOS or Linux. It accepts controller, runtime, label, and directory settings, keeps tokens in private files, replaces the binary atomically on upgrade, and offers `--no-start` to stage files.
+- `tessera` and `tessera session` open a session for CLI commands and questions. Quoted paths work, command errors leave the session open, and exiting leaves the cluster running. A controller-backed CLI test covers apply, get, and ask; service-manager commands use scripted tests.
+- Agents use a saved controller address even when the token came from the token file, and persist an address discovered for an installed node. CLI environment overrides also work before a client file exists.
+
 ## 0.9.0 (early work)
 
 - Added a pure infrastructure planner for networks, machines, and Apps. It shows stable generations, orders create actions by dependency, and proposes destructive changes for confirmation. The CLI currently compares with a local state file; no cloud apply path exists yet.

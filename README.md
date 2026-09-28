@@ -28,6 +28,8 @@ The controller advertises `_tessera._tcp`. Copy the token once. After that, disc
 
 State lives in `$TESSERA_DATA` or `~/.tessera`. Override the client with `TESSERA_URL` and `TESSERA_TOKEN`.
 
+Run `tessera` or `tessera session` to open a session against your configured controller. Enter `get apps`, `apply -f app.yaml`, `import -f deploy.yaml`, or another CLI command to run it. Any other line is a question, answered through the same deterministic diagnosis as `ask`. Commands accept quoted paths, such as `apply -f "my app.yaml"`, and an optional `tessera` prefix. Errors leave the session open. Type `exit` or `quit`, or close standard input, to leave the cluster running. Start long-running processes such as `up`, `agent`, and `mcp` in a separate terminal; use file paths for manifests inside a session.
+
 ## What you write
 
 ```yaml
@@ -108,7 +110,16 @@ tessera mcp --kubeconfig /path/to/kubeconfig --namespace demo
 
 ## Boot and backup
 
-`tessera install` writes a launchd agent or a systemd user unit. It does not load it. `tessera backup -o tessera-backup.db` copies the SQLite store. For an offline replacement controller, run `tessera restore -f tessera-backup.db --data NEW_DIRECTORY` before starting it. Restore checks the backup, refuses an existing database, preserves the cluster token and data, assigns a fresh controller identity, and advances the leader epoch. `--epoch N` sets a higher minimum epoch when agents have seen a later leader. Stop or fence the previous leader before starting the replacement; image cache files are separate from the database backup.
+`tessera install` copies the running binary to `~/.local/bin/tessera`, writes a launchd agent on macOS or a systemd user unit on Linux, and starts it. The service runs `tessera agent` against an existing controller. Supply `--url` and `--token`, or use the saved controller configuration. With only a token, the agent discovers the controller over mDNS and saves its address for subsequent CLI commands. The token stays in private files in the data directory. `--runtime` and `--labels` configure the installed node, `--bin-dir` changes the binary destination, and `--data` changes the cluster data directory. Use the same `TESSERA_DATA` directory for subsequent CLI commands. Add the binary directory to your shell's `PATH` if needed.
+
+```sh
+./tessera install --url http://controller:7468 --token "$TESSERA_TOKEN"
+~/.local/bin/tessera
+```
+
+For the first machine, run `tessera controller` in one terminal, then `tessera install` in another to start its agent from the saved configuration. `tessera up` remains the combined controller and agent path for foreground use. Keep one agent process per node data directory. Re-running install replaces the binary atomically and restarts the user service. `--no-start` writes the files without changing the running service; omit it on a subsequent install to activate the service. Service startup errors are reported even when the files were installed successfully. macOS writes agent output to `DATA_DIRECTORY/agent.log`; Linux uses the user journal. These are user services and follow the platform's user-session lifecycle.
+
+`tessera backup -o tessera-backup.db` copies the SQLite store. For an offline replacement controller, run `tessera restore -f tessera-backup.db --data NEW_DIRECTORY` before starting it. Restore checks the backup, refuses an existing database, preserves the cluster token and data, assigns a fresh controller identity, and advances the leader epoch. `--epoch N` sets a higher minimum epoch when agents have seen a later leader. Stop or fence the previous leader before starting the replacement; image cache files are separate from the database backup.
 
 `tessera up` restarts itself through a watchdog unless you pass `--watched` or set `TESSERA_WATCHED=1`. A clean exit is not restarted. A child that dies within 500ms is not restarted either.
 

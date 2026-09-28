@@ -22,7 +22,7 @@ Shipped. One binary, SQLite, LAN join, placement, make-before-break moves, playb
 
 ## 0.1.1
 
-Shipped as the priority roadmap. The CLI below is the next build, not this tag.
+The tag shipped the priority roadmap. Its CLI step is now implemented: install copies the binary and starts a user service running `tessera agent`, and `tessera` opens a command-and-question session against the configured controller. CLI tests cover service files and startup commands on macOS and Linux, binary replacement, private credentials, and a session applying and inspecting an App through a real local controller. Live service-manager acceptance on both platforms remains open.
 
 The CLI is how you install Tessera, command it, and talk to the agent. One binary. Not a second tool. Nothing else matters if a person cannot install it and ask it what is wrong.
 

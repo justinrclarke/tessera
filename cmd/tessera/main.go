@@ -11,7 +11,6 @@ import (
 	"os"
 	"os/signal"
 	"path/filepath"
-	"runtime"
 	"strings"
 	"syscall"
 	"time"
@@ -46,8 +45,7 @@ func main() {
 
 func run(args []string) error {
 	if len(args) == 0 {
-		usage()
-		return nil
+		return cmdSession(nil)
 	}
 	switch args[0] {
 	case "help", "-h", "--help":
@@ -74,6 +72,8 @@ func run(args []string) error {
 		return cmdConfirm(args[1:])
 	case "ask":
 		return cmdAsk(args[1:])
+	case "session":
+		return cmdSession(args[1:])
 	case "mcp":
 		return cmdMCP(args[1:])
 	case "import":
@@ -109,6 +109,8 @@ The controller places work, heals known failures, and can elect a new leader
 from a signed snapshot if the current one dies. Destructive actions stay proposed.
 
   tessera up [--listen :7468] [--runtime auto|docker|ctr|fake] [--labels KEY=VALUE,...]
+  tessera install [--url http://controller:7468] [--token TOKEN] [--runtime auto|docker|ctr|fake]
+  tessera session
   tessera apply -f app.yaml
   tessera get apps|nodes|assignments|actions|routes
   tessera confirm [id]
@@ -216,12 +218,12 @@ func cmdAgent(args []string) error {
 			*token = strings.TrimSpace(string(b))
 		}
 	}
-	if *token == "" {
-		if cfg, err := config.Load(config.Dir()); err == nil {
+	if cfg, err := config.Load(config.Dir()); err == nil {
+		if *token == "" {
 			*token = cfg.Token
-			if *urlFlag == "" {
-				*urlFlag = cfg.URL
-			}
+		}
+		if *urlFlag == "" {
+			*urlFlag = cfg.URL
 		}
 	}
 	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
@@ -243,6 +245,11 @@ func cmdAgent(args []string) error {
 	}
 	if *token == "" {
 		return fmt.Errorf("token required (--token, TESSERA_TOKEN, or ~/.tessera/token)")
+	}
+	if cfg, err := config.Load(config.Dir()); err == nil && cfg.URL == "" && cfg.Token == *token {
+		if err := config.Save(config.Dir(), config.File{URL: url, Token: *token}); err != nil {
+			return fmt.Errorf("save discovered controller: %w", err)
+		}
 	}
 	rtm, err := rt.Open(*runtimeName)
 	if err != nil {
@@ -635,67 +642,6 @@ func cmdRestore(args []string) error {
 	return store.RestoreBackup(*file, filepath.Join(*data, "tessera.db"), *epoch)
 }
 
-func cmdInstall(args []string) error {
-	fs := flag.NewFlagSet("install", flag.ContinueOnError)
-	data := fs.String("data", config.Dir(), "data directory")
-	if err := fs.Parse(args); err != nil {
-		return err
-	}
-	bin, err := os.Executable()
-	if err != nil {
-		return err
-	}
-	switch runtime.GOOS {
-	case "darwin":
-		home, err := os.UserHomeDir()
-		if err != nil {
-			return err
-		}
-		path := filepath.Join(home, "Library", "LaunchAgents", "tessera.plist")
-		body := fmt.Sprintf(`<?xml version="1.0" encoding="UTF-8"?>
-<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
-<plist version="1.0"><dict>
-<key>Label</key><string>tessera</string>
-<key>ProgramArguments</key><array><string>%s</string><string>up</string><string>--watched</string><string>--data</string><string>%s</string></array>
-<key>RunAtLoad</key><true/>
-<key>KeepAlive</key><true/>
-</dict></plist>
-`, bin, *data)
-		if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
-			return err
-		}
-		if err := os.WriteFile(path, []byte(body), 0o644); err != nil {
-			return err
-		}
-		fmt.Printf("wrote %s\nload it with: launchctl load %s\n", path, path)
-		return nil
-	case "linux":
-		home, err := os.UserHomeDir()
-		if err != nil {
-			return err
-		}
-		path := filepath.Join(home, ".config", "systemd", "user", "tessera.service")
-		body := fmt.Sprintf(`[Unit]
-Description=Tessera
-[Service]
-ExecStart=%s up --watched --data %s
-Restart=always
-[Install]
-WantedBy=default.target
-`, bin, *data)
-		if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
-			return err
-		}
-		if err := os.WriteFile(path, []byte(body), 0o644); err != nil {
-			return err
-		}
-		fmt.Printf("wrote %s\nenable it with: systemctl --user enable --now tessera\n", path)
-		return nil
-	default:
-		return fmt.Errorf("install is not implemented for %s", runtime.GOOS)
-	}
-}
-
 func startController(ctx context.Context, listen, data string) (*controller.Server, *client.Client, error) {
 	if err := os.MkdirAll(data, 0o755); err != nil {
 		return nil, nil, err
@@ -738,7 +684,7 @@ func startController(ctx context.Context, listen, data string) (*controller.Serv
 
 func openClient() (*client.Client, error) {
 	cfg, err := config.Load(config.Dir())
-	if err != nil {
+	if err != nil && (os.Getenv("TESSERA_URL") == "" || os.Getenv("TESSERA_TOKEN") == "") {
 		return nil, fmt.Errorf("no controller config at %s (run tessera up first)", config.Dir())
 	}
 	if v := os.Getenv("TESSERA_URL"); v != "" {
@@ -746,6 +692,9 @@ func openClient() (*client.Client, error) {
 	}
 	if v := os.Getenv("TESSERA_TOKEN"); v != "" {
 		cfg.Token = v
+	}
+	if cfg.URL == "" {
+		return nil, fmt.Errorf("no controller URL saved yet; wait for the installed agent to discover it or set TESSERA_URL")
 	}
 	return client.New(cfg.URL, cfg.Token), nil
 }
