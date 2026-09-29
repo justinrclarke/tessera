@@ -116,6 +116,7 @@ from a signed snapshot if the current one dies. Destructive actions stay propose
   tessera confirm [id]
   tessera ask "why is web down"
   tessera agent [--url http://controller:7468]
+  tessera controller [--id ID --raft-listen HOST:PORT --peers ID=RAFT_ADDRESS@HTTP_URL,... --bootstrap]
   tessera import -f deploy.yaml
   tessera mcp
   tessera backup -o tessera-backup.db
@@ -183,12 +184,32 @@ func cmdController(args []string) error {
 	fs := flag.NewFlagSet("controller", flag.ContinueOnError)
 	listen := fs.String("listen", "0.0.0.0:7468", "listen address")
 	data := fs.String("data", config.Dir(), "data directory")
+	id := fs.String("id", "", "stable controller ID")
+	token := fs.String("token", os.Getenv("TESSERA_TOKEN"), "shared cluster token")
+	raftListen := fs.String("raft-listen", "", "replication listen address")
+	peersArg := fs.String("peers", "", "three ID=RAFT_ADDRESS@HTTP_URL peers, separated by commas")
+	bootstrap := fs.Bool("bootstrap", false, "bootstrap a new three-controller cluster once")
 	if err := fs.Parse(args); err != nil {
 		return err
 	}
+	cfg := controller.Config{ID: *id, Token: *token}
+	if *peersArg != "" {
+		peers, err := parseControllerPeers(*peersArg)
+		if err != nil {
+			return err
+		}
+		cfg.Replicas = &controller.ReplicaConfig{Listen: *raftListen, Peers: peers, Bootstrap: *bootstrap}
+		for _, peer := range peers {
+			if peer.ID == *id {
+				cfg.URL = peer.URL
+			}
+		}
+	} else if *raftListen != "" || *bootstrap {
+		return fmt.Errorf("--raft-listen and --bootstrap require --peers")
+	}
 	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
 	defer stop()
-	srv, cl, err := startController(ctx, *listen, *data)
+	srv, cl, err := startControllerConfig(ctx, *listen, *data, cfg)
 	if err != nil {
 		return err
 	}
@@ -247,7 +268,7 @@ func cmdAgent(args []string) error {
 		return fmt.Errorf("token required (--token, TESSERA_TOKEN, or ~/.tessera/token)")
 	}
 	if cfg, err := config.Load(config.Dir()); err == nil && cfg.URL == "" && cfg.Token == *token {
-		if err := config.Save(config.Dir(), config.File{URL: url, Token: *token}); err != nil {
+		if err := config.Save(config.Dir(), config.File{URL: url, Token: *token, Controllers: cfg.Controllers}); err != nil {
 			return fmt.Errorf("save discovered controller: %w", err)
 		}
 	}
@@ -256,6 +277,9 @@ func cmdAgent(args []string) error {
 		return fmt.Errorf("runtime: %w", err)
 	}
 	ag := &agent.Agent{ID: *id, DataDir: *data, Token: *token, URL: url, Client: client.New(url, *token), Runtime: rtm, Labels: labels}
+	if cfg, err := config.Load(config.Dir()); err == nil {
+		ag.Client.SetControllers(cfg.Controllers)
+	}
 	err = ag.Run(ctx)
 	if ctx.Err() != nil || errors.Is(err, agent.ErrHalted) {
 		return nil
@@ -620,12 +644,7 @@ func cmdBackup(args []string) error {
 	if err := fs.Parse(args); err != nil {
 		return err
 	}
-	st, err := store.Open(filepath.Join(*data, "tessera.db"))
-	if err != nil {
-		return err
-	}
-	defer st.Close()
-	return st.Backup(*out)
+	return store.BackupFile(filepath.Join(*data, "tessera.db"), *out)
 }
 
 func cmdRestore(args []string) error {
@@ -643,6 +662,10 @@ func cmdRestore(args []string) error {
 }
 
 func startController(ctx context.Context, listen, data string) (*controller.Server, *client.Client, error) {
+	return startControllerConfig(ctx, listen, data, controller.Config{Token: os.Getenv("TESSERA_TOKEN")})
+}
+
+func startControllerConfig(ctx context.Context, listen, data string, cfg controller.Config) (*controller.Server, *client.Client, error) {
 	if err := os.MkdirAll(data, 0o755); err != nil {
 		return nil, nil, err
 	}
@@ -650,23 +673,49 @@ func startController(ctx context.Context, listen, data string) (*controller.Serv
 	if err != nil {
 		return nil, nil, err
 	}
-	srv, err := controller.New(st, controller.Config{DataDir: data, Token: os.Getenv("TESSERA_TOKEN")})
-	if err != nil {
-		return nil, nil, err
-	}
 	ln, err := net.Listen("tcp", listen)
 	if err != nil {
+		st.Close()
+		return nil, nil, err
+	}
+	cfg.DataDir = data
+	srv, err := controller.New(st, cfg)
+	if err != nil {
+		ln.Close()
+		st.Close()
+		return nil, nil, err
+	}
+	if err := os.WriteFile(filepath.Join(data, "token"), []byte(srv.Token+"\n"), 0o600); err != nil {
+		ln.Close()
+		srv.Close()
+		st.Close()
 		return nil, nil, err
 	}
 	go func() { _ = srv.Serve(ctx, ln) }()
 	cl := client.New("http://"+reachable(ln.Addr().String()), srv.Token)
-	_ = config.Save(data, config.File{URL: cl.Base, Token: srv.Token})
-	deadline := time.Now().Add(3 * time.Second)
-	for time.Now().Before(deadline) {
-		if cl.Health(context.Background()) == nil {
+	if cfg.Replicas != nil {
+		cl = client.New(cfg.URL, srv.Token)
+		var controllers []string
+		for _, peer := range cfg.Replicas.Peers {
+			controllers = append(controllers, peer.URL)
+		}
+		cl.SetControllers(controllers)
+	}
+	healthClient := client.New("http://"+reachable(ln.Addr().String()), srv.Token)
+	healthCtx, healthCancel := context.WithTimeout(ctx, 3*time.Second)
+	defer healthCancel()
+	ready := false
+	for healthCtx.Err() == nil {
+		if healthClient.Health(healthCtx) == nil {
+			ready = true
 			break
 		}
 		time.Sleep(20 * time.Millisecond)
+	}
+	if !ready {
+		srv.Close()
+		st.Close()
+		return nil, nil, fmt.Errorf("controller failed to start: %w", healthCtx.Err())
 	}
 	_, port, _ := net.SplitHostPort(ln.Addr().String())
 	p, _ := net.LookupPort("tcp", port)
@@ -675,9 +724,6 @@ func startController(ctx context.Context, listen, data string) (*controller.Serv
 			<-ctx.Done()
 			_ = stop()
 		}()
-	}
-	if err := os.WriteFile(filepath.Join(data, "token"), []byte(srv.Token+"\n"), 0o600); err != nil {
-		return nil, nil, err
 	}
 	return srv, cl, nil
 }
@@ -696,7 +742,17 @@ func openClient() (*client.Client, error) {
 	if cfg.URL == "" {
 		return nil, fmt.Errorf("no controller URL saved yet; wait for the installed agent to discover it or set TESSERA_URL")
 	}
-	return client.New(cfg.URL, cfg.Token), nil
+	cl := client.New(cfg.URL, cfg.Token)
+	cl.SetControllers(cfg.Controllers)
+	if len(cl.Controllers()) == 0 {
+		var cache struct {
+			Controllers []string `json:"controllers"`
+		}
+		if body, err := os.ReadFile(filepath.Join(config.Dir(), "agent", "cache.json")); err == nil && json.Unmarshal(body, &cache) == nil {
+			cl.SetControllers(cache.Controllers)
+		}
+	}
+	return cl, nil
 }
 
 func readFile(path string) ([]byte, error) {

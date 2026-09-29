@@ -8,6 +8,7 @@ Dependencies stay on the known set. Do not add an unknown module to get a featur
 
 - `gopkg.in/yaml.v3`
 - `github.com/hashicorp/mdns`
+- `github.com/hashicorp/raft` (0.4.0 consensus; its log and stable stores use the existing SQLite connection)
 - `github.com/modelcontextprotocol/go-sdk`
 - `golang.org/x/sys`
 - `modernc.org/sqlite`
@@ -64,13 +65,17 @@ Custom resource instances and operator behavior remain outside the conversion bo
 
 The controller is cattle, including when you meant to run more than one. Snapshot promotion already covers a dead leader. This is the step after that, not before the daily path works.
 
-The offline store recovery path is implemented: `tessera restore` validates a `tessera backup` database, refuses to overwrite an existing store, retains the cluster token, and starts a replacement identity at a higher epoch. Three-controller consensus and live state replication are still open; the single-writer and fencing rules remain release requirements.
+Three-controller replication is implemented and locally verified with `github.com/hashicorp/raft`. Each controller keeps its command log, election state, and resource state through the existing single SQLite connection. Mutations require a majority; followers direct clients to the elected leader. Elections advance the committed epoch and preserve running assignment identities. Agents remember all three addresses, reconnect, and keep their highest observed epoch across restarts. Agents in a replica cluster do not promote themselves outside consensus.
+
+The offline recovery path also accepts a replica backup: `tessera restore` validates the database, refuses an existing target, retains committed resources and release history, removes the previous consensus identity, and starts a replacement at a higher epoch. The CLI reads a live database through a read-only connection for backup. Stop or fence all previous replicas before starting an offline replacement.
 
 - Three controller replicas, leader election, and replicated state.
 - Agents reconnect. Workloads do not restart because the leader changed.
 - `tessera backup` restores that store onto a new leader.
 
-Implementation gate: choose an established consensus implementation as an explicit direct-dependency roadmap change, then route every controller mutation through one replicated command log. A follower must reject writes and direct clients to the elected leader. A majority must be required to commit; minority partitions must stop writes, and epochs must fence stale assignment commands. The acceptance drill starts three controllers, kills the leader during an App update, verifies one committed generation and uninterrupted workload, then partitions the old leader and proves it cannot mutate state. SQLite remains a local state machine store, never a concurrently shared writer.
+The acceptance drill starts three controllers, loses the leader's response during an App update, retries the same request through an election, and verifies one committed generation and an unchanged workload with no restart. It restarts the old leader, checks catch-up, isolates it, rejects its write, and restores a replica backup after stopping the cluster. Controller tests also cover every mutation endpoint on a minority, exact signed snapshot bytes, authenticated TLS replication, and recovery from both a snapshot and later log entries after a full restart. Race checks pass for the controller, agent, store, client, and drill packages.
+
+Membership is a fixed set of three stable IDs and addresses. New clusters require empty stores; changing membership or converting a populated standalone controller into a replica cluster is not implemented. Image cache files stay local and are not replicated. Acceptance across three physical machines remains open.
 
 ## 0.5.0
 

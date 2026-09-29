@@ -44,6 +44,7 @@ func Run() ([]Report, error) {
 		{"route follows a move", routeFollowsMove},
 		{"cached image skips the registry", cachedImage},
 		{"backup restores onto a new leader", backupRestore},
+		{"replicas survive an update and reject minority writes", replicatedController},
 		{"confirm wipe clears the node", confirmWipe},
 		{"confirm reimage rejoins", confirmReimage},
 		{"confirm delete removes the app", confirmDelete},

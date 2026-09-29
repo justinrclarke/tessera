@@ -166,6 +166,7 @@ type Action struct {
 }
 
 type Snapshot struct {
+	Controllers []string     `json:"controllers,omitempty"`
 	Index       uint64       `json:"index"`
 	Epoch       uint64       `json:"epoch"`
 	LeaderID    string       `json:"leader_id"`
@@ -179,11 +180,12 @@ type Snapshot struct {
 }
 
 type Lease struct {
-	Epoch    uint64    `json:"epoch"`
-	LeaderID string    `json:"leader_id"`
-	Expires  time.Time `json:"expires"`
-	Leading  bool      `json:"leading"`
-	URL      string    `json:"url,omitempty"`
+	Controllers []string  `json:"controllers,omitempty"`
+	Epoch       uint64    `json:"epoch"`
+	LeaderID    string    `json:"leader_id"`
+	Expires     time.Time `json:"expires"`
+	Leading     bool      `json:"leading"`
+	URL         string    `json:"url,omitempty"`
 }
 
 func (p Policy) Cooldown() time.Duration {

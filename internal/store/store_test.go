@@ -76,6 +76,38 @@ func TestBackup(t *testing.T) {
 	}
 }
 
+func TestBackupFileReadsLiveStoreAndRejectsMissingSource(t *testing.T) {
+	dir := t.TempDir()
+	source := filepath.Join(dir, "source.db")
+	s, err := Open(source)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer s.Close()
+	if err := s.SetMeta("live", "committed"); err != nil {
+		t.Fatal(err)
+	}
+	target := filepath.Join(dir, "backup.db")
+	if err := BackupFile(source, target); err != nil {
+		t.Fatal(err)
+	}
+	backup, err := Open(target)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer backup.Close()
+	if value, err := backup.Meta("live"); err != nil || value != "committed" {
+		t.Fatalf("live backup: %q %v", value, err)
+	}
+	missing := filepath.Join(dir, "missing.db")
+	if err := BackupFile(missing, filepath.Join(dir, "missing-backup.db")); err == nil {
+		t.Fatal("accepted missing source")
+	}
+	if _, err := os.Stat(missing); !os.IsNotExist(err) {
+		t.Fatalf("backup created a source database: %v", err)
+	}
+}
+
 func TestRestoreBackupAdvancesEpochAndChangesIdentity(t *testing.T) {
 	s := open(t)
 	for key, value := range map[string]string{"token": "shared-token", "epoch": "7", "controller_id": "old-leader"} {

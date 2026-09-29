@@ -108,9 +108,11 @@ func installUser(goos, home, source string, uid int, opts installOptions, run se
 		return fmt.Errorf("cluster token required: pass --token or start a controller with tessera up first")
 	}
 	if opts.URL != "" {
-		u, err := url.Parse(opts.URL)
-		if err != nil || (u.Scheme != "http" && u.Scheme != "https") || u.Host == "" || u.User != nil {
-			return fmt.Errorf("controller URL must be an http or https URL without embedded credentials")
+		for _, endpoint := range strings.Split(opts.URL, ",") {
+			u, err := url.Parse(endpoint)
+			if err != nil || (u.Scheme != "http" && u.Scheme != "https") || u.Host == "" || u.User != nil {
+				return fmt.Errorf("controller URL must be an http or https URL without embedded credentials")
+			}
 		}
 	}
 	bin := filepath.Join(opts.BinDir, "tessera")
@@ -136,7 +138,7 @@ func installUser(goos, home, source string, uid int, opts installOptions, run se
 	if err := installFile(bin, f, 0o755); err != nil {
 		return err
 	}
-	cfgBody, err := json.MarshalIndent(config.File{URL: opts.URL, Token: opts.Token}, "", "  ")
+	cfgBody, err := json.MarshalIndent(config.File{URL: opts.URL, Token: opts.Token, Controllers: cfg.Controllers}, "", "  ")
 	if err != nil {
 		return err
 	}

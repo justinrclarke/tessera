@@ -26,9 +26,12 @@
 
 - Agents now report NVIDIA GPU UUIDs, model names, and free memory from `nvidia-smi`. Apps and Models can request a GPU model and minimum free memory; placement reserves distinct devices and Docker passes their UUIDs to the NVIDIA Container Toolkit. The containerd runtime reports GPU workloads as unsupported. NVIDIA host acceptance remains open.
 
-## 0.4.0 (early work)
+## 0.4.0 (local implementation verified)
 
-- Added offline `tessera restore` for a database created by `tessera backup`. It verifies the database, uses a fresh controller identity and higher epoch, and refuses to overwrite an existing store. Live three-controller replication remains open.
+- Added three-controller consensus with Hashicorp Raft, an atomic replicated command log through the existing SQLite connection, and mutual TLS for replication. Followers redirect clients, and minority partitions cannot commit resource changes.
+- Agents and CLI clients learn all three addresses and retry through elections. Successful mutation receipts survive leader changes, running assignment IDs stay fixed, and agents persist fencing epochs and decline standalone promotion in replica clusters.
+- The acceptance drill covers a lost update response, leader failover, workload continuity, restarted replica catch-up, a partitioned old leader, and offline recovery. Real local TCP/TLS tests cover full restart from a snapshot and subsequent log entries. Multi-machine acceptance remains open; membership is fixed and new clusters require empty stores.
+- Offline `tessera restore` preserves committed resources and release history from replica backups while clearing old consensus state and advancing the epoch. `tessera backup` reads a live database without opening another writer. Image cache files remain separate.
 
 ## 0.3.0 (in progress)
 

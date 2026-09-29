@@ -2,7 +2,7 @@
 
 Tessera is a single Go binary that runs containers across machines on a LAN. You say what should be running. The controller places it, restarts it, and moves it. You do not assemble Deployments, Services, and probes by hand.
 
-Healing is deterministic. A model is optional, and only for explanation. If the controller dies, a node with the newest signed snapshot can take over. Wipe, reimage, and delete are never done automatically.
+Healing is deterministic. A model is optional, and only for explanation. If a standalone controller dies, a node with the newest signed snapshot can take over. With three controller replicas, a majority elects the replacement and agents reconnect without restarting running work. Wipe, reimage, and delete are never done automatically.
 
 What is coming next is in [ROADMAP.md](ROADMAP.md).
 
@@ -119,7 +119,41 @@ tessera mcp --kubeconfig /path/to/kubeconfig --namespace demo
 
 For the first machine, run `tessera controller` in one terminal, then `tessera install` in another to start its agent from the saved configuration. `tessera up` remains the combined controller and agent path for foreground use. Keep one agent process per node data directory. Re-running install replaces the binary atomically and restarts the user service. `--no-start` writes the files without changing the running service; omit it on a subsequent install to activate the service. Service startup errors are reported even when the files were installed successfully. macOS writes agent output to `DATA_DIRECTORY/agent.log`; Linux uses the user journal. These are user services and follow the platform's user-session lifecycle.
 
-`tessera backup -o tessera-backup.db` copies the SQLite store. For an offline replacement controller, run `tessera restore -f tessera-backup.db --data NEW_DIRECTORY` before starting it. Restore checks the backup, refuses an existing database, preserves the cluster token and data, assigns a fresh controller identity, and advances the leader epoch. `--epoch N` sets a higher minimum epoch when agents have seen a later leader. Stop or fence the previous leader before starting the replacement; image cache files are separate from the database backup.
+`tessera backup -o tessera-backup.db` copies the local SQLite store through a read-only connection while the controller may be running. For an offline replacement controller, run `tessera restore -f tessera-backup.db --data NEW_DIRECTORY` before starting it. Restore checks the backup, refuses an existing database, preserves the cluster token and committed data, assigns a fresh controller identity, and advances the leader epoch. A replica backup also clears old consensus metadata and logs. `--epoch N` sets a higher minimum epoch when agents have seen a later leader. Stop or fence every previous controller before starting the replacement; image cache files are separate from the database backup.
+
+## Three controller replicas
+
+Start a new cluster on three machines with empty controller data directories, stable controller IDs, and the same `TESSERA_TOKEN`. Give every process the same peer list. Each peer entry is `ID=RAFT_ADDRESS@HTTP_URL`; the addresses must be reachable by the other controllers and agents. Replication uses mutual TLS authenticated by the shared token. The HTTP API uses the bearer token; use the trusted LAN or an HTTPS reverse proxy for it.
+
+Set this peer list on each machine, replacing the hostnames with your own:
+
+```sh
+PEERS='a=controller-a:7469@http://controller-a:7468,b=controller-b:7469@http://controller-b:7468,c=controller-c:7469@http://controller-c:7468'
+```
+
+On controller A:
+
+```sh
+tessera controller --id a --listen :7468 --raft-listen :7469 --data ~/.tessera-a --peers "$PEERS" --bootstrap
+```
+
+On controller B and controller C, respectively:
+
+```sh
+tessera controller --id b --listen :7468 --raft-listen :7469 --data ~/.tessera-b --peers "$PEERS"
+tessera controller --id c --listen :7468 --raft-listen :7469 --data ~/.tessera-c --peers "$PEERS"
+```
+
+Use `--bootstrap` on A for the first start. Restart each controller with its original ID, directory, token, and peer list. A stored replica database requires the replica configuration when reopened. Membership changes and converting an existing standalone database into replicas are not supported.
+
+Agents and CLI clients can start with one listed HTTP URL and learn the others, or take all three URLs separated by commas to tolerate an unavailable initial controller:
+
+```sh
+tessera install --url http://controller-a:7468,http://controller-b:7468,http://controller-c:7468 --token "$TESSERA_TOKEN"
+TESSERA_URL=http://controller-a:7468,http://controller-b:7468,http://controller-c:7468 tessera get apps
+```
+
+Two controllers are required to commit changes. If a majority is unreachable, existing containers continue running and agents keep reconnecting; they do not create another standalone leader. Controller state and release history are replicated. Image cache files stay on each controller, so images needed after failover must also be available from their registry or the node runtime. Route ports remain local to each controller; this does not provide a floating network address for Routes. The acceptance drill and TCP/TLS restart tests run locally without Docker; acceptance on three physical machines remains open.
 
 `tessera up` restarts itself through a watchdog unless you pass `--watched` or set `TESSERA_WATCHED=1`. A clean exit is not restarted. A child that dies within 500ms is not restarted either.
 
