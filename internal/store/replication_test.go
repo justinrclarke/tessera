@@ -66,6 +66,37 @@ func TestCaptureCommitsAtomicallyAndPreservesIntegers(t *testing.T) {
 	}
 }
 
+func TestReceiptPruningReplicatesAndPreservesRecentRetries(t *testing.T) {
+	s := open(t)
+	for key, value := range map[string]string{
+		"request:expired": `{"code":200,"expires":100}`,
+		"request:recent":  `{"code":200,"expires":300}`,
+		"request:legacy":  `{"code":200}`,
+	} {
+		if err := s.SetMeta(key, value); err != nil {
+			t.Fatal(err)
+		}
+	}
+	batch, err := s.Capture(func(staged *Store) error { return staged.PruneReceipts(time.Unix(200, 0)) })
+	if err != nil {
+		t.Fatal(err)
+	}
+	if value, _ := s.Meta("request:expired"); value == "" {
+		t.Fatal("pruned receipt before consensus committed")
+	}
+	if _, err := s.ApplyBatch(1, batch); err != nil {
+		t.Fatal(err)
+	}
+	if value, _ := s.Meta("request:expired"); value != "" {
+		t.Fatal("expired receipt retained")
+	}
+	for _, key := range []string{"request:recent", "request:legacy"} {
+		if value, _ := s.Meta(key); value == "" {
+			t.Fatalf("lost a retained retry receipt: %s", key)
+		}
+	}
+}
+
 func TestStalePreparedCommandCannotOverwriteCommittedState(t *testing.T) {
 	s := open(t)
 	first, err := s.Capture(func(staged *Store) error { return staged.PutApp(api.App{Name: "web", Image: "v1"}) })

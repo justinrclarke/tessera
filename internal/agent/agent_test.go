@@ -199,3 +199,63 @@ func TestWipeKeepsStateWhenStopFails(t *testing.T) {
 		t.Fatalf("removed cache after failed stop: %v", err)
 	}
 }
+
+func TestCorruptCacheCannotStartAgentWithFreshIdentity(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "cache.json")
+	body := []byte(`{"epoch":`)
+	if err := os.WriteFile(path, body, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	ag := &Agent{DataDir: dir, Runtime: runtime.NewFake()}
+	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+	defer cancel()
+	if err := ag.Run(ctx); err == nil || errors.Is(err, context.DeadlineExceeded) {
+		t.Fatalf("agent ignored corrupt fencing state: %v", err)
+	}
+	saved, err := os.ReadFile(path)
+	if err != nil || string(saved) != string(body) {
+		t.Fatalf("agent replaced corrupt cache: %s %v", saved, err)
+	}
+}
+
+type exitedOnStart struct{ *runtime.Fake }
+
+func (r exitedOnStart) Start(ctx context.Context, spec runtime.Spec) (runtime.Container, error) {
+	c, err := r.Fake.Start(ctx, spec)
+	r.Fake.Kill(c.ID, "crash", false)
+	c.Running = false
+	return c, err
+}
+
+func TestImmediateExitCannotMarkReleaseHealthy(t *testing.T) {
+	for _, kind := range []string{api.KindApp, api.KindJob} {
+		t.Run(kind, func(t *testing.T) {
+			var reports []client.StatusReport
+			srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				if r.URL.Path != "/v1/assignments/fast-exit/status" {
+					http.NotFound(w, r)
+					return
+				}
+				var report client.StatusReport
+				if err := json.NewDecoder(r.Body).Decode(&report); err != nil {
+					t.Error(err)
+				}
+				reports = append(reports, report)
+				_, _ = w.Write([]byte(`{}`))
+			}))
+			defer srv.Close()
+			ag := &Agent{DataDir: t.TempDir(), Runtime: exitedOnStart{runtime.NewFake()}, Client: client.New(srv.URL, "token")}
+			if err := ag.ConvergeForTest(context.Background(), []api.Assignment{{ID: "fast-exit", Image: "image", Kind: kind, Status: api.StatusPending}}, true); err != nil {
+				t.Fatal(err)
+			}
+			want := api.StatusFailed
+			if kind == api.KindJob {
+				want = api.StatusSucceeded
+			}
+			if len(reports) != 1 || reports[0].Status != want {
+				t.Fatalf("exited process marked healthy: %+v", reports)
+			}
+		})
+	}
+}

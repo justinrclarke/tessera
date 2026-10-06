@@ -204,10 +204,17 @@ func (s *Server) handleRegister(w http.ResponseWriter, r *http.Request) {
 		Labels: req.Labels, LastSeen: now, DiskFree: req.DiskFree, DiskTotal: req.DiskTotal,
 		CertNotBefore: cert.NotBefore, CertNotAfter: cert.NotAfter, Epoch: s.Epoch(),
 	}
+	s.mu.Lock()
+	if previous, err := s.Store.GetNode(req.ID); err == nil && previous.Status == api.NodeCordoned {
+		n.Status = previous.Status
+		n.CordonedAt = previous.CordonedAt
+	}
 	if err := s.Store.PutNode(n); err != nil {
+		s.mu.Unlock()
 		http.Error(w, err.Error(), http.StatusInternalServerError)
 		return
 	}
+	s.mu.Unlock()
 	_ = s.Reconcile(now)
 	writeJSON(w, http.StatusOK, client.RegisterResponse{
 		CertPEM: string(cert.CertPEM), KeyPEM: string(cert.KeyPEM), CAPem: string(s.ca.CertPEM),
@@ -368,6 +375,18 @@ func (s *Server) handleStatus(w http.ResponseWriter, r *http.Request) {
 	if err != nil {
 		s.mu.Unlock()
 		http.Error(w, "not found", http.StatusNotFound)
+		return
+	}
+	if !api.Active(asg.Status) && rep.Status != asg.Status {
+		s.mu.Unlock()
+		http.Error(w, "assignment is already terminal", http.StatusConflict)
+		return
+	}
+	switch rep.Status {
+	case api.StatusPending, api.StatusRunning, api.StatusFailed, api.StatusSucceeded:
+	default:
+		s.mu.Unlock()
+		http.Error(w, "invalid assignment status", http.StatusBadRequest)
 		return
 	}
 	asg.Status = rep.Status

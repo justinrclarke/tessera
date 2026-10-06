@@ -93,6 +93,7 @@ func waitReplicaDrill(fn func() bool) error {
 type lostUpdateResponse struct {
 	base http.RoundTripper
 	kill func()
+	body bool
 }
 
 func (r *lostUpdateResponse) RoundTrip(req *http.Request) (*http.Response, error) {
@@ -103,10 +104,18 @@ func (r *lostUpdateResponse) RoundTrip(req *http.Request) (*http.Response, error
 		kill := r.kill
 		r.kill = nil
 		kill()
+		if r.body {
+			response.Body = io.NopCloser(&lostResponseBody{})
+			return response, nil
+		}
 		return nil, io.ErrUnexpectedEOF
 	}
 	return response, err
 }
+
+type lostResponseBody struct{}
+
+func (*lostResponseBody) Read([]byte) (int, error) { return 0, io.ErrUnexpectedEOF }
 
 type trackedRuntime struct {
 	*runtime.Fake
@@ -179,7 +188,7 @@ func replicatedController() error {
 		return fmt.Errorf("steady workload did not start")
 	}
 	oldEpoch := d.servers[leader].Epoch()
-	cl.HTTP.Transport = &lostUpdateResponse{base: cl.HTTP.Transport, kill: func() { d.stop(leader) }}
+	cl.HTTP.Transport = &lostUpdateResponse{base: cl.HTTP.Transport, kill: func() { d.stop(leader) }, body: true}
 	if err := cl.Apply(ctx, []byte("kind: App\nname: web\nimage: v2\n")); err != nil {
 		return fmt.Errorf("update retry after leader loss: %w", err)
 	}

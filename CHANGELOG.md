@@ -1,5 +1,16 @@
 # Changelog
 
+## 0.4.0 (unreleased)
+
+- Added `tessera get controllers` to inspect each controller's role, fencing epoch, committed and applied log indexes, and ability to accept writes. Followers and minority controllers remain inspectable without redirecting; the endpoint requires the cluster token.
+- Replica clients retry truncated response bodies with the original mutation ID. The acceptance drill now loses the response body during a leader election. Image transfers retain the caller's deadline instead of inheriting the short controller request timeout.
+- Added a real three-process TCP/TLS acceptance test that abruptly kills a controller, loses quorum, restarts a replica from its existing store, and verifies running workload identity and zero container restarts. It runs in `go test ./...` without Docker. Physical-machine acceptance remains open.
+- Registration preserves a node's cordon until the cooldown and fresh-heartbeat conditions allow uncordoning. Late status reports cannot revive stopped or succeeded assignments. Multiple replicas can share a node, completed moves do not cause extra replicas and can move again after cooldown, and partial Job completion counts toward the desired worker count.
+- Docker inspects exited Tessera containers for their actual exit code and OOM state, so successful Jobs are not mistaken for crashes. A process that exits immediately after start cannot mark an App release healthy. Disposable Docker container and successful Job smoke tests passed on the local OrbStack engine.
+- Agent fencing state and client configuration use atomic, durable private-file replacement. A corrupt agent cache stops startup without replacing the saved identity. SQLite databases, sidecars, and backups have private permissions; Raft snapshot directories are private.
+- Replicated retry receipts are pruned through consensus: operator mutations are retained for 24 hours, and registration, heartbeat, and status receipts for two minutes. Legacy receipts remain available. Receipt retention is an automatic retry window, not permanent deduplication of manually reused IDs.
+- App, Route, and Policy manifests reject unknown top-level fields. Apps reject unsupported health probes, invalid TCP ports, and negative resource or replica requests. Explicit `replicas: 0` scales an App down. Kubernetes import reports workloads requiring storage, sidecars, init containers, probes, security context, or environment references as skipped instead of silently deploying a partial conversion.
+
 ## 0.3.0 (2026-10-06)
 
 Kubernetes bridge and CLI completion, with early implementations of later roadmap milestones included below. This release includes the 0.2.0 runtime and Docker lab changes.

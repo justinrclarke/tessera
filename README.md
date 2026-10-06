@@ -8,6 +8,8 @@ What is coming next is in [ROADMAP.md](ROADMAP.md).
 
 ## Run
 
+Published binaries are available for each OS and architecture from the [latest release](https://github.com/justinrclarke/tessera/releases/latest), with SHA-256 checksums. The unreleased 0.4.0 commands and fixes described here require building this branch:
+
 ```
 go build -o tessera ./cmd/tessera
 ./tessera up
@@ -32,6 +34,8 @@ Run `tessera` or `tessera session` to open a session against your configured con
 
 ## What you write
 
+Save this as `app.yaml`. Docker assigns separate workload ports so both replicas can run on one node; the Route gives clients a fixed port:
+
 ```yaml
 kind: App
 name: web
@@ -40,15 +44,33 @@ replicas: 2
 sensitive_to: cpu
 ports:
   - container: 80
-    host: 8080
 resources:
   cpu: 100m
   memory: 128Mi
+---
+kind: Route
+name: web
+app: web
+port: 8080
+target_port: 80
 ```
+
+With `tessera up` running in another terminal, apply the file and check the workload:
+
+```sh
+./tessera apply -f app.yaml
+./tessera get apps
+./tessera get controllers
+curl --retry 10 --retry-all-errors --retry-delay 1 http://127.0.0.1:8080/
+```
+
+Use Docker for this HTTP trial. `--runtime fake` exercises the control plane and does not serve the container's HTTP endpoint. `READY` currently counts running container processes; startup and HTTP readiness probes are not implemented. Unsupported `health` settings and unknown App fields fail explicitly. Stop the trial workload by changing `replicas` to `0`, applying the file again, and checking `tessera get assignments` for stopped assignments before exiting `up`. Exiting a CLI session leaves workloads running.
+
+Run one Tessera agent per Docker daemon. Its runtime manages containers with the `tessera_` prefix; a second agent pointing at the same daemon can stop the first agent's workloads. The Docker lab gives each node its own daemon. Use disposable stateless workloads for the trial; persistent volumes and stateful identity are not implemented.
 
 Kinds: App, Job, Model, Route, Config, Secret, Policy. Separate documents with `---`.
 
-A Job runs to completion. Set `gang: true` when every replica must land together or not at all. A Model is an App that prefers GPU nodes. A Route is a stable port on the controller. When a move starts a replacement and that replacement is running, the route cuts over. The client keeps the same address.
+A Job runs to completion. Set `gang: true` when every replica must land together or not at all. A Model is an App that prefers GPU nodes. A Route is a stable port on the controller and selects one running backend; it does not load balance across replicas. When a move starts a replacement and that replacement is running, the route cuts over. The client keeps the same address.
 
 Start an agent with `--labels fabric=ethernet-a,storage=shared` to describe its host. An App or Job can require `node_labels: {storage: shared}`. For a gang Job, `gang_fabric: fabric` keeps all workers on nodes with the same `fabric` value. Labels describe a real link or shared mount; Tessera does not create either one.
 
@@ -106,6 +128,8 @@ tessera mcp --kubeconfig /path/to/kubeconfig --namespace demo
 
 `ask` and `mcp` use the same read-only tool names against the selected Kubernetes cluster. They inspect Deployments, StatefulSets, DaemonSets, Jobs, Pods, nodes, and warning events. Use `--context NAME` to select a context, or `--kubernetes` to use the current `kubectl` context. These flags select the Kubernetes bridge instead of the Tessera controller. Workloads in different namespaces need `namespace/name` for `get_app` and `logs`. The bridge does not mutate Kubernetes objects or record Tessera actions. Your kubeconfig needs read access to the inspected resources.
 
+Import skips and reports workloads requiring storage volumes, sidecars, init containers, health probes, security context, service account settings, or environment references rather than dropping those requirements. Review `--dry-run` output and every skipped report before applying. Persistent application data and stateful identity are not migrated. Service selector mapping, namespace collisions, per-node DaemonSet placement, and multiple target ports still need acceptance; the current supported trial is a simple stateless workload with one TCP port.
+
 `sh lab/kubernetes.sh` runs the 0.3.0 handoff drill with an isolated kind cluster and kubeconfig. It diagnoses a failed image pull, converts a Deployment and Service, applies them to the local Tessera lab, checks the resulting Route, and removes its test clusters. It requires `kind`, `kubectl`, Docker Compose, Go, and `curl`, and refuses to replace an already running Tessera lab.
 
 ## Boot and backup
@@ -154,6 +178,12 @@ TESSERA_URL=http://controller-a:7468,http://controller-b:7468,http://controller-
 ```
 
 Two controllers are required to commit changes. If a majority is unreachable, existing containers continue running and agents keep reconnecting; they do not create another standalone leader. Controller state and release history are replicated. Image cache files stay on each controller, so images needed after failover must also be available from their registry or the node runtime. Route ports remain local to each controller; this does not provide a floating network address for Routes. The acceptance drill and TCP/TLS restart tests run locally without Docker; acceptance on three physical machines remains open.
+
+`tessera get controllers` inspects each configured address directly, including followers and an isolated controller. It shows role, write availability, fencing epoch, and committed and applied log indexes, and reports unreachable addresses. A healthy HTTP process can still be unable to commit because it lacks a majority. The status endpoint requires the cluster token. Successful operator request receipts survive elections for 24 hours; registration, heartbeat, and status receipts have a two-minute retry window. Do not manually replay old mutation IDs as a permanent deduplication mechanism.
+
+The process acceptance test starts three CLI controllers with private temporary stores and real TCP/TLS replication, kills a leader abruptly, removes quorum, and recovers quorum from a restarted replica without restarting the workload. Run it with `go test ./cmd/tessera -run TestControllerProcesses -count=1`. It complements the full snapshot, log, partition, and offline-recovery tests; it does not establish cross-machine networking or a stable Route address.
+
+Databases, sidecars, and backups contain cluster credentials and Secret values and use private file permissions. Raft snapshot directories are private. Keep application-data backups separate: `tessera backup` copies control-plane state and does not back up volumes or container filesystems. See the trial and reliability gates in [ROADMAP.md](ROADMAP.md) for readiness, safe upgrades, Route availability, access control, and capacity work that remains open.
 
 `tessera up` restarts itself through a watchdog unless you pass `--watched` or set `TESSERA_WATCHED=1`. A clean exit is not restarted. A child that dies within 500ms is not restarted either.
 

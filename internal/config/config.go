@@ -4,6 +4,8 @@ import (
 	"encoding/json"
 	"os"
 	"path/filepath"
+
+	"tessera/internal/fileutil"
 )
 
 type File struct {
@@ -34,12 +36,9 @@ func Load(dir string) (File, error) {
 }
 
 func Save(dir string, f File) error {
-	if err := os.MkdirAll(dir, 0o755); err != nil {
-		return err
-	}
 	b, err := json.MarshalIndent(f, "", "  ")
 	if err != nil {
 		return err
 	}
-	return os.WriteFile(filepath.Join(dir, "client.json"), b, 0o600)
+	return fileutil.Write(filepath.Join(dir, "client.json"), b, 0o600)
 }

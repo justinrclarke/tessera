@@ -196,6 +196,12 @@ func (c *Client) ListRoutes(ctx context.Context) ([]api.Route, error) {
 	return out, err
 }
 
+func (c *Client) ControllerStatus(ctx context.Context) (api.ControllerStatus, error) {
+	var out api.ControllerStatus
+	err := c.get(ctx, "/v1/controllers", &out)
+	return out, err
+}
+
 func (c *Client) Leader(ctx context.Context) (api.Lease, error) {
 	var out api.Lease
 	err := c.get(ctx, "/v1/leader", &out)
@@ -359,6 +365,10 @@ func (c *Client) post(ctx context.Context, path string, body any, dest any) erro
 }
 
 func (c *Client) do(ctx context.Context, method, path string, body io.Reader) (*http.Response, error) {
+	return c.doRequest(ctx, method, path, body, api.NewID())
+}
+
+func (c *Client) doRequest(ctx context.Context, method, path string, body io.Reader, requestID string) (*http.Response, error) {
 	req, err := http.NewRequestWithContext(ctx, method, c.Endpoint()+path, body)
 	if err != nil {
 		return nil, err
@@ -367,7 +377,7 @@ func (c *Client) do(ctx context.Context, method, path string, body io.Reader) (*
 		req.Header.Set("Authorization", "Bearer "+c.Token)
 	}
 	if method == http.MethodPost || method == http.MethodPut {
-		req.Header.Set("X-Tessera-Request-ID", api.NewID())
+		req.Header.Set("X-Tessera-Request-ID", requestID)
 	}
 	if method == http.MethodPost && body != nil {
 		req.Header.Set("Content-Type", "application/json")
@@ -424,7 +434,7 @@ func (c *Client) do(ctx context.Context, method, path string, body io.Reader) (*
 		attempt++
 		attemptCtx := ctx
 		cancel := func() {}
-		if len(c.Controllers()) > 0 {
+		if len(c.Controllers()) > 0 && current.URL.Path != "/v1/images" {
 			duration := 3 * time.Second
 			waitMS, _ := strconv.ParseInt(current.URL.Query().Get("wait_ms"), 10, 64)
 			if waitMS > 0 && waitMS <= 60000 {
@@ -507,21 +517,38 @@ func (r *responseBody) Close() error {
 }
 
 func (c *Client) call(ctx context.Context, method, path string, body []byte, auth bool) ([]byte, error) {
-	var r io.Reader
-	if body != nil {
-		r = bytes.NewReader(body)
+	requestID := api.NewID()
+	retryUntil := time.Now().Add(5 * time.Second)
+	for {
+		var r io.Reader
+		if body != nil {
+			r = bytes.NewReader(body)
+		}
+		resp, err := c.doRequest(ctx, method, path, r, requestID)
+		if err != nil {
+			return nil, err
+		}
+		b, err := io.ReadAll(io.LimitReader(resp.Body, 8<<20))
+		resp.Body.Close()
+		if err != nil {
+			if ctx.Err() != nil {
+				return nil, ctx.Err()
+			}
+			if len(c.Controllers()) == 0 || !time.Now().Before(retryUntil) {
+				return nil, err
+			}
+			timer := time.NewTimer(100 * time.Millisecond)
+			select {
+			case <-ctx.Done():
+				timer.Stop()
+				return nil, ctx.Err()
+			case <-timer.C:
+			}
+			continue
+		}
+		if resp.StatusCode >= 300 {
+			return nil, fmt.Errorf("%s %s: %s", method, path, strings.TrimSpace(string(b)))
+		}
+		return b, nil
 	}
-	resp, err := c.do(ctx, method, path, r)
-	if err != nil {
-		return nil, err
-	}
-	defer resp.Body.Close()
-	b, err := io.ReadAll(io.LimitReader(resp.Body, 8<<20))
-	if err != nil {
-		return nil, err
-	}
-	if resp.StatusCode >= 300 {
-		return nil, fmt.Errorf("%s %s: %s", method, path, strings.TrimSpace(string(b)))
-	}
-	return b, nil
 }

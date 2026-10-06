@@ -35,6 +35,12 @@ func Convert(b []byte) (Result, error) {
 	var res Result
 	for _, doc := range docs {
 		kind := str(doc["kind"])
+		if kind == "Deployment" || kind == "StatefulSet" || kind == "DaemonSet" || kind == "Job" {
+			if reason := unsupportedWorkload(doc); reason != "" {
+				res.Skipped = append(res.Skipped, kind+"/"+metaName(doc)+": "+reason)
+				continue
+			}
+		}
 		if kind == "Service" || kind == "Ingress" {
 			routes := routes(doc)
 			if len(routes) == 0 {
@@ -67,6 +73,36 @@ func Convert(b []byte) (Result, error) {
 	}
 	res.YAML = string(raw)
 	return res, nil
+}
+
+func unsupportedWorkload(doc map[string]any) string {
+	spec := mapOf(doc["spec"])
+	pod := mapOf(mapOf(spec["template"])["spec"])
+	if len(sliceOf(spec["volumeClaimTemplates"])) > 0 || len(sliceOf(pod["volumes"])) > 0 {
+		return "storage volumes are not converted"
+	}
+	if len(sliceOf(pod["containers"])) > 1 || len(sliceOf(pod["initContainers"])) > 0 {
+		return "sidecars and init containers are not converted"
+	}
+	for _, field := range []string{"securityContext", "serviceAccountName", "hostNetwork", "hostPID", "hostIPC"} {
+		if value := pod[field]; value != nil && value != false && value != "" {
+			return field + " is not converted"
+		}
+	}
+	for _, item := range sliceOf(pod["containers"]) {
+		container := mapOf(item)
+		for _, field := range []string{"volumeMounts", "volumeDevices", "envFrom", "readinessProbe", "livenessProbe", "startupProbe", "securityContext", "lifecycle"} {
+			if container[field] != nil {
+				return field + " is not converted"
+			}
+		}
+		for _, env := range sliceOf(container["env"]) {
+			if mapOf(env)["valueFrom"] != nil {
+				return "environment references are not converted"
+			}
+		}
+	}
+	return ""
 }
 
 func FromCluster(kubeconfig string) (Result, error) {

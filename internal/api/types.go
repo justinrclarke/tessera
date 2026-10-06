@@ -188,6 +188,18 @@ type Lease struct {
 	URL         string    `json:"url,omitempty"`
 }
 
+type ControllerStatus struct {
+	ID           string `json:"id"`
+	URL          string `json:"url"`
+	Role         string `json:"role"`
+	LeaderID     string `json:"leader_id"`
+	Epoch        uint64 `json:"epoch"`
+	CommitIndex  uint64 `json:"commit_index"`
+	AppliedIndex uint64 `json:"applied_index"`
+	Writable     bool   `json:"writable"`
+	Error        string `json:"error,omitempty"`
+}
+
 func (p Policy) Cooldown() time.Duration {
 	d, err := time.ParseDuration(p.MoveCooldown)
 	if err != nil || d == 0 {

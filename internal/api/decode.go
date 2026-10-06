@@ -107,8 +107,11 @@ func decodeApp(raw map[string]any, kind string) (App, error) {
 		return App{}, err
 	}
 	app.Kind = kind
-	if app.Replicas == 0 {
+	if _, specified := raw["replicas"]; !specified {
 		app.Replicas = 1
+	}
+	if app.Replicas < 0 {
+		return App{}, fmt.Errorf("app %s: replicas cannot be negative", app.Name)
 	}
 	if app.Name == "" {
 		return App{}, fmt.Errorf("app name is required")
@@ -117,6 +120,11 @@ func decodeApp(raw map[string]any, kind string) (App, error) {
 		return App{}, fmt.Errorf("app %s: image is required", app.Name)
 	}
 	if res, ok := resRaw.(map[string]any); ok {
+		for key := range res {
+			if key != "cpu" && key != "memory" {
+				return App{}, fmt.Errorf("app %s: unknown resource %q", app.Name, key)
+			}
+		}
 		cpu, err := ParseMilliCPU(res["cpu"])
 		if err != nil {
 			return App{}, err
@@ -126,6 +134,19 @@ func decodeApp(raw map[string]any, kind string) (App, error) {
 			return App{}, err
 		}
 		app.Resources = Resources{CPU: cpu, Memory: mem}
+	} else if resRaw != nil {
+		return App{}, fmt.Errorf("app %s: resources must contain cpu or memory", app.Name)
+	}
+	if app.Resources.CPU < 0 || app.Resources.Memory < 0 {
+		return App{}, fmt.Errorf("app %s: resources cannot be negative", app.Name)
+	}
+	if app.Health != nil {
+		return App{}, fmt.Errorf("app %s: health probes are not implemented", app.Name)
+	}
+	for _, port := range app.Ports {
+		if port.Container < 1 || port.Container > 65535 || port.Host < 0 || port.Host > 65535 || (port.Protocol != "" && !strings.EqualFold(port.Protocol, "tcp")) {
+			return App{}, fmt.Errorf("app %s: ports require TCP and numbers between 1 and 65535", app.Name)
+		}
 	}
 	if gpuMemoryRaw != nil {
 		gpuMemory, err := ParseMemory(gpuMemoryRaw)
@@ -172,12 +193,14 @@ func decodeMapKind(raw map[string]any, kind string) (namedData, error) {
 }
 
 func decodePolicy(raw map[string]any) (Policy, error) {
+	mv, _ := raw["move"].(map[string]any)
+	delete(raw, "move")
 	var p Policy
 	if err := remarshal(raw, &p); err != nil {
 		return Policy{}, err
 	}
 	p.Kind = KindPolicy
-	if mv, ok := raw["move"].(map[string]any); ok {
+	if mv != nil {
 		if g, ok := mv["min_gain"]; ok {
 			fmtS := scalarString(g)
 			var f float64
@@ -208,7 +231,9 @@ func remarshal(raw map[string]any, dest any) error {
 	if err != nil {
 		return err
 	}
-	return yaml.Unmarshal(b, dest)
+	decoder := yaml.NewDecoder(bytes.NewReader(b))
+	decoder.KnownFields(true)
+	return decoder.Decode(dest)
 }
 
 func scalarString(v any) string {

@@ -167,9 +167,6 @@ func (s *Server) scheduleLocked(now time.Time, pol api.Policy) error {
 		changed = true
 	}
 	for _, p := range plan.Place {
-		if hasPlacement(asgs, p) {
-			continue
-		}
 		asg, err := s.assignmentFrom(p, now)
 		if err != nil {
 			return err
@@ -375,15 +372,6 @@ func (s *Server) notifyLocked() {
 		}
 	}
 	s.waiters = nil
-}
-
-func hasPlacement(asgs []api.Assignment, p schedule.Placement) bool {
-	for _, a := range asgs {
-		if a.App == p.App && a.NodeID == p.NodeID && a.Generation == p.Generation && a.Replaces == p.Replaces && api.Active(a.Status) {
-			return true
-		}
-	}
-	return false
 }
 
 func jsonMarshal(v any) ([]byte, error) {

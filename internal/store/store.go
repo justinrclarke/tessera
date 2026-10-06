@@ -24,8 +24,25 @@ type Store struct {
 }
 
 func Open(path string) (*Store, error) {
-	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
+	if err := os.MkdirAll(filepath.Dir(path), 0o700); err != nil {
 		return nil, err
+	}
+	f, err := os.OpenFile(path, os.O_CREATE|os.O_RDWR, 0o600)
+	if err != nil {
+		return nil, err
+	}
+	err = f.Chmod(0o600)
+	closeErr := f.Close()
+	if err != nil {
+		return nil, err
+	}
+	if closeErr != nil {
+		return nil, closeErr
+	}
+	for _, suffix := range []string{"-wal", "-shm", "-journal"} {
+		if err := os.Chmod(path+suffix, 0o600); err != nil && !os.IsNotExist(err) {
+			return nil, err
+		}
 	}
 	u := url.URL{Scheme: "file", Path: path, RawQuery: "_pragma=busy_timeout(5000)&_pragma=journal_mode(WAL)"}
 	db, err := sql.Open("sqlite", u.String())
@@ -460,9 +477,24 @@ func (s *Store) LoadSnapshot(snap api.Snapshot, epoch uint64) error {
 }
 
 func (s *Store) Backup(path string) error {
+	return backupTo(path, func(query string) error { _, err := s.exec(query); return err })
+}
+
+func backupTo(path string, execute func(string) error) error {
+	f, err := os.OpenFile(path, os.O_CREATE|os.O_EXCL|os.O_WRONLY, 0o600)
+	if err != nil {
+		return err
+	}
+	if err := f.Close(); err != nil {
+		os.Remove(path)
+		return err
+	}
 	q := fmt.Sprintf("VACUUM INTO '%s'", escape(path))
-	_, err := s.exec(q)
-	return err
+	if err := execute(q); err != nil {
+		os.Remove(path)
+		return err
+	}
+	return nil
 }
 
 func BackupFile(source, target string) error {
@@ -473,8 +505,7 @@ func BackupFile(source, target string) error {
 	}
 	defer reader.Close()
 	reader.SetMaxOpenConns(1)
-	_, err = reader.Exec(fmt.Sprintf("VACUUM INTO '%s'", escape(target)))
-	return err
+	return backupTo(target, func(query string) error { _, err := reader.Exec(query); return err })
 }
 
 func RestoreBackup(source, target string, minEpoch uint64) error {

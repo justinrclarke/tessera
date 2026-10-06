@@ -54,3 +54,25 @@ func TestDockerStartsWithReservedGPUDevice(t *testing.T) {
 		t.Fatalf("Docker GPU start: %+v, %v", got, err)
 	}
 }
+
+func TestDockerListInspectsExitStatusAndOOM(t *testing.T) {
+	d := NewDocker("unused")
+	d.http = &http.Client{Transport: transportFunc(func(req *http.Request) (*http.Response, error) {
+		var body string
+		switch req.URL.Path {
+		case "/v1.41/containers/json":
+			body = `[{"Id":"done","Names":["/tessera_done"],"State":"exited"},{"Id":"oom","Names":["/tessera_oom"],"State":"exited"},{"Id":"foreign","Names":["/other"],"State":"exited"}]`
+		case "/v1.41/containers/done/json":
+			body = `{"State":{"Running":false,"ExitCode":0}}`
+		case "/v1.41/containers/oom/json":
+			body = `{"State":{"Running":false,"ExitCode":137,"OOMKilled":true}}`
+		default:
+			t.Fatalf("unexpected request: %s", req.URL.Path)
+		}
+		return &http.Response{StatusCode: http.StatusOK, Body: io.NopCloser(strings.NewReader(body)), Header: make(http.Header)}, nil
+	})}
+	items, err := d.List(context.Background())
+	if err != nil || len(items) != 2 || items[0].ExitCode != 0 || items[0].Running || !items[1].OOM || items[1].ExitCode != 137 {
+		t.Fatalf("incorrect job completion or OOM state: %+v %v", items, err)
+	}
+}

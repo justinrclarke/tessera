@@ -60,7 +60,7 @@ func Plan(in Input) Result {
 			continue
 		}
 		app, ok := apps[asg.App]
-		if !ok {
+		if !ok || app.Replicas == 0 {
 			stop[asg.ID] = true
 			continue
 		}
@@ -83,7 +83,7 @@ func Plan(in Input) Result {
 	}
 	for _, asg := range in.Assignments {
 		if asg.Replaces != "" && asg.Status == api.StatusRunning && api.Active(asg.Status) && !stop[asg.ID] {
-			if _, ok := find(in.Assignments, asg.Replaces); ok {
+			if old, ok := find(in.Assignments, asg.Replaces); ok && api.Active(old.Status) {
 				stop[asg.Replaces] = true
 			}
 		}
@@ -139,7 +139,9 @@ func Plan(in Input) Result {
 		extra := 0
 		for _, asg := range cur {
 			if asg.Replaces != "" {
-				extra++
+				if _, replacing := find(cur, asg.Replaces); replacing {
+					extra++
+				}
 			}
 		}
 		count := len(cur) - extra
@@ -150,9 +152,7 @@ func Plan(in Input) Result {
 					done++
 				}
 			}
-			if done >= app.Replicas {
-				continue
-			}
+			count += done
 		}
 		if count < app.Replicas {
 			need := app.Replicas - count
@@ -187,7 +187,9 @@ func Plan(in Input) Result {
 			cands := make([]api.Assignment, 0, len(cur))
 			for _, asg := range cur {
 				if asg.Replaces != "" {
-					continue
+					if _, replacing := find(cur, asg.Replaces); replacing {
+						continue
+					}
 				}
 				replaced := false
 				for _, o := range cur {
@@ -239,7 +241,7 @@ func move(app api.App, cur []api.Assignment, ready []api.Node, used map[string]a
 	var oldest api.Assignment
 	found := false
 	for _, asg := range cur {
-		if asg.Status != api.StatusRunning || asg.Replaces != "" {
+		if asg.Status != api.StatusRunning {
 			continue
 		}
 		for _, o := range cur {

@@ -172,6 +172,48 @@ func TestMoveCompletesWhenReplacementRuns(t *testing.T) {
 	if len(got.Stop) != 1 || got.Stop[0] != "old" {
 		t.Fatalf("%+v", got)
 	}
+	if len(got.Place) != 0 {
+		t.Fatalf("completed replacement caused another replica: %+v", got)
+	}
+}
+
+func TestSettledReplacementCanMoveAgainAfterCooldown(t *testing.T) {
+	a := app("web", 1)
+	in := Input{
+		Apps: []api.App{a}, Nodes: []api.Node{node("fast", api.NodeReady, 2, 4000), node("faster", api.NodeReady, 5, 4000)},
+		Assignments: []api.Assignment{
+			{ID: "old", App: "web", NodeID: "slow", Generation: 1, Status: api.StatusStopped},
+			{ID: "settled", App: "web", NodeID: "fast", Generation: 1, Status: api.StatusRunning, Replaces: "old"},
+		},
+		AllowMove: true, Cooldown: time.Minute, Now: time.Unix(100, 0), LastMove: map[string]time.Time{"web": time.Unix(1, 0)},
+	}
+	got := Plan(in)
+	if len(got.Place) != 1 || got.Place[0].Replaces != "settled" || got.Place[0].NodeID != "faster" || len(got.Stop) != 0 {
+		t.Fatalf("settled move created a replica or could not move again: %+v", got)
+	}
+	if got := Plan(Input{Apps: in.Apps, Nodes: in.Nodes, Assignments: in.Assignments}); len(got.Place) != 0 || len(got.Stop) != 0 {
+		t.Fatalf("settled replacement was not stable: %+v", got)
+	}
+}
+
+func TestScalingStopsSettledAndPendingMoves(t *testing.T) {
+	a := app("web", 1)
+	in := Input{
+		Apps: []api.App{a}, Nodes: []api.Node{node("a", api.NodeReady, 1, 4000)},
+		Assignments: []api.Assignment{
+			{ID: "one", App: "web", NodeID: "a", Generation: 1, Status: api.StatusRunning, Replaces: "gone-one"},
+			{ID: "two", App: "web", NodeID: "a", Generation: 1, Status: api.StatusRunning, Replaces: "gone-two"},
+		},
+	}
+	if got := Plan(in); len(got.Stop) != 1 || len(got.Place) != 0 {
+		t.Fatalf("settled moves prevented scale-down: %+v", got)
+	}
+	in.Apps[0].Replicas = 0
+	in.Assignments[1].Replaces = "one"
+	in.Assignments[1].Status = api.StatusPending
+	if got := Plan(in); len(got.Stop) != 2 || len(got.Place) != 0 {
+		t.Fatalf("pending move prevented scale-to-zero: %+v", got)
+	}
 }
 
 func TestCooldownBlocksMove(t *testing.T) {
@@ -240,6 +282,23 @@ func TestRunningJobDoesNotMoveWithoutCheckpoint(t *testing.T) {
 	}
 	if got := Plan(in); len(got.Place) != 0 || len(got.Stop) != 0 {
 		t.Fatalf("moved job without checkpoint: %+v", got)
+	}
+}
+
+func TestCompletedJobWorkersCountTowardReplicas(t *testing.T) {
+	a := app("batch", 3)
+	a.Kind = api.KindJob
+	in := Input{
+		Apps: []api.App{a}, Nodes: []api.Node{node("a", api.NodeReady, 1, 4000)},
+		Assignments: []api.Assignment{
+			{ID: "done", App: a.Name, NodeID: "a", Generation: 1, Status: api.StatusSucceeded},
+			{ID: "working", App: a.Name, NodeID: "a", Generation: 1, Status: api.StatusRunning},
+			{ID: "old", App: a.Name, NodeID: "a", Generation: 0, Status: api.StatusSucceeded},
+		},
+	}
+	got := Plan(in)
+	if len(got.Place) != 1 || len(got.Stop) != 0 {
+		t.Fatalf("completed worker was replaced: %+v", got)
 	}
 }
 

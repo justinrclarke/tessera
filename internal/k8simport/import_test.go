@@ -103,3 +103,19 @@ spec:
 		t.Fatalf("routes: %+v", res.Objects)
 	}
 }
+
+func TestImportReportsUnsafePartialWorkloads(t *testing.T) {
+	for _, podSpec := range []string{
+		`{"containers":[{"image":"db"}],"volumes":[{"name":"data","persistentVolumeClaim":{"claimName":"data"}}]}`,
+		`{"containers":[{"image":"web"},{"image":"sidecar"}]}`,
+		`{"containers":[{"image":"web","readinessProbe":{"httpGet":{"path":"/ready","port":80}}}]}`,
+		`{"containers":[{"image":"web","env":[{"name":"PASSWORD","valueFrom":{"secretKeyRef":{"name":"db","key":"password"}}}]}]}`,
+		`{"containers":[{"image":"web"}],"securityContext":{"runAsNonRoot":true}}`,
+	} {
+		manifest := `{"kind":"Deployment","metadata":{"name":"unsafe"},"spec":{"template":{"spec":` + podSpec + `}}}`
+		res, err := Convert([]byte(manifest))
+		if err != nil || len(res.Objects) != 0 || len(res.Skipped) != 1 || !strings.Contains(res.Skipped[0], "not converted") {
+			t.Fatalf("unsafe partial conversion: %+v %v", res, err)
+		}
+	}
+}

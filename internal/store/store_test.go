@@ -65,6 +65,13 @@ func TestBackup(t *testing.T) {
 	if err := s.Backup(path); err != nil {
 		t.Fatal(err)
 	}
+	info, err := os.Stat(path)
+	if err != nil || info.Mode().Perm() != 0o600 {
+		t.Fatalf("backup exposes credentials: %v %v", info, err)
+	}
+	if err := s.Backup(path); err == nil {
+		t.Fatal("backup overwrote an existing file")
+	}
 	s2, err := Open(path)
 	if err != nil {
 		t.Fatal(err)
@@ -91,6 +98,10 @@ func TestBackupFileReadsLiveStoreAndRejectsMissingSource(t *testing.T) {
 	if err := BackupFile(source, target); err != nil {
 		t.Fatal(err)
 	}
+	info, err := os.Stat(target)
+	if err != nil || info.Mode().Perm() != 0o600 {
+		t.Fatalf("live backup exposes credentials: %v %v", info, err)
+	}
 	backup, err := Open(target)
 	if err != nil {
 		t.Fatal(err)
@@ -105,6 +116,30 @@ func TestBackupFileReadsLiveStoreAndRejectsMissingSource(t *testing.T) {
 	}
 	if _, err := os.Stat(missing); !os.IsNotExist(err) {
 		t.Fatalf("backup created a source database: %v", err)
+	}
+	if _, err := os.Stat(filepath.Join(dir, "missing-backup.db")); !os.IsNotExist(err) {
+		t.Fatalf("failed backup left a partial destination: %v", err)
+	}
+}
+
+func TestOpenProtectsDatabaseAndSidecars(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "tessera.db")
+	if err := os.WriteFile(path, nil, 0o644); err != nil {
+		t.Fatal(err)
+	}
+	s, err := Open(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer s.Close()
+	if err := s.SetMeta("token", "secret"); err != nil {
+		t.Fatal(err)
+	}
+	for _, suffix := range []string{"", "-wal", "-shm"} {
+		info, err := os.Stat(path + suffix)
+		if err != nil || info.Mode().Perm() != 0o600 {
+			t.Fatalf("database%s exposes credentials: %v %v", suffix, info, err)
+		}
 	}
 }
 

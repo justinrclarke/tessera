@@ -17,6 +17,7 @@ import (
 	"tessera/internal/client"
 	"tessera/internal/controller"
 	"tessera/internal/discover"
+	"tessera/internal/fileutil"
 	"tessera/internal/gpu"
 	"tessera/internal/host"
 	"tessera/internal/runtime"
@@ -69,7 +70,9 @@ var ErrHalted = errors.New("halted")
 
 func (a *Agent) Run(ctx context.Context) error {
 	a.init()
-	_ = a.restore(ctx)
+	if err := a.restore(ctx); err != nil {
+		return err
+	}
 	for {
 		if err := ctx.Err(); err != nil {
 			return err
@@ -175,10 +178,13 @@ func (a *Agent) observeEpoch(epoch uint64) error {
 	if err != nil && !os.IsNotExist(err) {
 		return err
 	}
-	a.maxEpoch = epoch
 	c.Epoch = epoch
 	c.NodeID = a.ID
-	return a.writeCache(c)
+	if err := a.writeCache(c); err != nil {
+		return err
+	}
+	a.maxEpoch = epoch
+	return nil
 }
 
 func (a *Agent) SaveForTest(asgs []api.Assignment) error {
@@ -264,7 +270,10 @@ func (a *Agent) restore(ctx context.Context) error {
 	a.init()
 	c, err := a.readCache()
 	if err != nil {
-		return nil
+		if os.IsNotExist(err) {
+			return nil
+		}
+		return fmt.Errorf("read agent cache: %w", err)
 	}
 	if c.NodeID != "" {
 		a.ID = c.NodeID
@@ -353,6 +362,21 @@ func (a *Agent) converge(ctx context.Context, desired []api.Assignment, live boo
 		if started.Name == "" {
 			started.Name = name
 		}
+		if !started.Running {
+			if d.Kind == api.KindJob && started.ExitCode == 0 && !started.OOM {
+				a.report(ctx, d, api.StatusSucceeded, "", started)
+			} else {
+				reason := started.Reason
+				if started.OOM {
+					reason = "oom"
+				}
+				if reason == "" {
+					reason = fmt.Sprintf("crash: exited with code %d", started.ExitCode)
+				}
+				a.report(ctx, d, api.StatusFailed, reason, started)
+			}
+			continue
+		}
 		a.report(ctx, d, api.StatusRunning, "", started)
 		a.publishImage(ctx, d.Image)
 	}
@@ -414,19 +438,27 @@ func (a *Agent) fetchSnapshot(ctx context.Context) error {
 	if !survive.AcceptAssignment(a.maxEpoch, signed.Snapshot.Epoch) || (signed.Snapshot.Epoch == a.snapEpoch && signed.Snapshot.Index < a.snapIndex) {
 		return fmt.Errorf("stale snapshot")
 	}
-	a.snapIndex = signed.Snapshot.Index
-	a.snapEpoch = signed.Snapshot.Epoch
-	if signed.Snapshot.Epoch > a.maxEpoch {
-		a.maxEpoch = signed.Snapshot.Epoch
+	c, err := a.readCache()
+	if err != nil && !os.IsNotExist(err) {
+		return err
 	}
-	c, _ := a.readCache()
+	epoch := a.maxEpoch
+	if signed.Snapshot.Epoch > epoch {
+		epoch = signed.Snapshot.Epoch
+	}
 	c.Snapshot = signed.Snapshot
 	c.Controllers = signed.Snapshot.Controllers
 	c.SnapBody = signed.Body
 	c.Sig = signed.Sig
-	c.Epoch = a.maxEpoch
+	c.Epoch = epoch
 	c.NodeID = a.ID
-	return a.writeCache(c)
+	if err := a.writeCache(c); err != nil {
+		return err
+	}
+	a.snapIndex = signed.Snapshot.Index
+	a.snapEpoch = signed.Snapshot.Epoch
+	a.maxEpoch = epoch
+	return nil
 }
 
 func (a *Agent) loadSnapshot() (api.Snapshot, error) {
@@ -448,7 +480,10 @@ func (a *Agent) loadSnapshot() (api.Snapshot, error) {
 }
 
 func (a *Agent) saveCache(desired []api.Assignment) error {
-	c, _ := a.readCache()
+	c, err := a.readCache()
+	if err != nil && !os.IsNotExist(err) {
+		return err
+	}
 	c.NodeID = a.ID
 	c.Assignments = desired
 	c.Epoch = a.maxEpoch
@@ -469,14 +504,11 @@ func (a *Agent) readCache() (diskCache, error) {
 }
 
 func (a *Agent) writeCache(c diskCache) error {
-	if err := os.MkdirAll(a.DataDir, 0o755); err != nil {
-		return err
-	}
 	b, err := json.MarshalIndent(c, "", "  ")
 	if err != nil {
 		return err
 	}
-	return os.WriteFile(a.cachePath(), b, 0o600)
+	return fileutil.Write(a.cachePath(), b, 0o600)
 }
 
 func (a *Agent) saveCert(cert, key string) error {

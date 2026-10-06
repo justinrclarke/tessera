@@ -112,7 +112,7 @@ from a signed snapshot if the current one dies. Destructive actions stay propose
   tessera install [--url http://controller:7468] [--token TOKEN] [--runtime auto|docker|ctr|fake]
   tessera session
   tessera apply -f app.yaml
-  tessera get apps|nodes|assignments|actions|routes
+  tessera get apps|nodes|assignments|actions|routes|controllers
   tessera confirm [id]
   tessera ask "why is web down"
   tessera agent [--url http://controller:7468]
@@ -391,7 +391,7 @@ func cmdGet(args []string) error {
 		return err
 	}
 	if fs.NArg() < 1 {
-		return fmt.Errorf("usage: tessera get apps|nodes|assignments|actions|routes")
+		return fmt.Errorf("usage: tessera get apps|nodes|assignments|actions|routes|controllers")
 	}
 	cl, err := openClient()
 	if err != nil {
@@ -399,6 +399,8 @@ func cmdGet(args []string) error {
 	}
 	ctx := context.Background()
 	switch fs.Arg(0) {
+	case "controllers", "controller":
+		return getControllers(ctx, cl, os.Stdout)
 	case "apps", "app":
 		if fs.NArg() == 2 {
 			app, err := cl.GetApp(ctx, fs.Arg(1))
