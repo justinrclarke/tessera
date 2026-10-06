@@ -1,6 +1,7 @@
 package controller
 
 import (
+	"context"
 	"fmt"
 	"net"
 	"strconv"
@@ -14,6 +15,9 @@ import (
 )
 
 func (s *Server) Reconcile(now time.Time) error {
+	if s.replica != nil {
+		return s.propose(context.Background(), now, func(worker *Server) error { return worker.Reconcile(now) })
+	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	if !s.leading {
@@ -215,6 +219,7 @@ func (s *Server) assignmentFrom(p schedule.Placement, now time.Time) (api.Assign
 		Ports:      app.Ports,
 		Resources:  app.Resources,
 		GPUs:       app.GPUs,
+		GPUDevices: p.GPUDevices,
 		Kind:       app.Kind,
 		Updated:    now,
 	}, nil
@@ -274,6 +279,7 @@ func (s *Server) writeSnapshotLocked(now time.Time) error {
 	snap := api.Snapshot{
 		Index: idx, Epoch: s.epoch, LeaderID: s.ID, Taken: now,
 		Apps: apps, Assignments: asgs, Policy: pol, Routes: routes, Configs: cfgs, Secrets: secs,
+		Controllers: s.controllerURLs(),
 	}
 	raw, err := jsonMarshal(snap)
 	if err != nil {

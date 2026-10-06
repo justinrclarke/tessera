@@ -6,35 +6,81 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"net"
 	"net/http"
 	"net/url"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	"tessera/internal/api"
 )
 
 type Client struct {
-	Base  string
-	Token string
-	HTTP  *http.Client
+	Base        string
+	Token       string
+	HTTP        *http.Client
+	mu          sync.RWMutex
+	controllers []string
 }
 
 func New(base, token string) *Client {
-	return &Client{Base: strings.TrimRight(base, "/"), Token: token, HTTP: &http.Client{Timeout: 60 * time.Second}}
+	urls := strings.Split(base, ",")
+	c := &Client{Base: strings.TrimRight(strings.TrimSpace(urls[0]), "/"), Token: token, HTTP: &http.Client{Timeout: 60 * time.Second, Transport: &http.Transport{DialContext: (&net.Dialer{Timeout: time.Second}).DialContext}}}
+	if len(urls) > 1 {
+		c.SetControllers(urls)
+	}
+	return c
+}
+
+func (c *Client) Endpoint() string {
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+	return c.Base
+}
+
+func (c *Client) Controllers() []string {
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+	return append([]string(nil), c.controllers...)
+}
+
+func (c *Client) SetControllers(values []string) {
+	var urls []string
+	seen := map[string]bool{}
+	for _, value := range values {
+		value = strings.TrimRight(strings.TrimSpace(value), "/")
+		u, err := url.Parse(value)
+		if err != nil || (u.Scheme != "http" && u.Scheme != "https") || u.Host == "" || u.User != nil || u.Path != "" || u.RawQuery != "" || u.Fragment != "" || seen[value] {
+			return
+		}
+		seen[value] = true
+		urls = append(urls, value)
+	}
+	if len(urls) != 3 {
+		return
+	}
+	c.mu.Lock()
+	if !seen[c.Base] {
+		c.mu.Unlock()
+		return
+	}
+	c.controllers = urls
+	c.mu.Unlock()
 }
 
 type RegisterRequest struct {
-	ID        string            `json:"id"`
-	Addr      string            `json:"addr"`
-	Capacity  api.Resources     `json:"capacity"`
-	Free      api.Resources     `json:"free"`
-	Perf      api.Perf          `json:"perf"`
-	GPUs      int               `json:"gpus"`
-	DiskFree  int64             `json:"disk_free"`
-	DiskTotal int64             `json:"disk_total"`
-	Labels    map[string]string `json:"labels,omitempty"`
+	ID           string            `json:"id"`
+	Addr         string            `json:"addr"`
+	Capacity     api.Resources     `json:"capacity"`
+	Free         api.Resources     `json:"free"`
+	Perf         api.Perf          `json:"perf"`
+	GPUs         int               `json:"gpus"`
+	GPUInventory []api.GPU         `json:"gpu_inventory,omitempty"`
+	DiskFree     int64             `json:"disk_free"`
+	DiskTotal    int64             `json:"disk_total"`
+	Labels       map[string]string `json:"labels,omitempty"`
 }
 
 type RegisterResponse struct {
@@ -47,13 +93,14 @@ type RegisterResponse struct {
 }
 
 type HeartbeatRequest struct {
-	Addr      string        `json:"addr"`
-	Capacity  api.Resources `json:"capacity"`
-	Free      api.Resources `json:"free"`
-	Perf      api.Perf      `json:"perf"`
-	GPUs      int           `json:"gpus"`
-	DiskFree  int64         `json:"disk_free"`
-	DiskTotal int64         `json:"disk_total"`
+	Addr         string        `json:"addr"`
+	Capacity     api.Resources `json:"capacity"`
+	Free         api.Resources `json:"free"`
+	Perf         api.Perf      `json:"perf"`
+	GPUs         int           `json:"gpus"`
+	GPUInventory []api.GPU     `json:"gpu_inventory,omitempty"`
+	DiskFree     int64         `json:"disk_free"`
+	DiskTotal    int64         `json:"disk_total"`
 }
 
 type HeartbeatResponse struct {
@@ -76,6 +123,7 @@ type NodeCommand struct {
 }
 
 type StatusReport struct {
+	Epoch     uint64 `json:"epoch,omitempty"`
 	Status    string `json:"status"`
 	Reason    string `json:"reason"`
 	Restarts  int    `json:"restarts"`
@@ -85,6 +133,7 @@ type StatusReport struct {
 }
 
 type Page struct {
+	Epoch       uint64           `json:"epoch,omitempty"`
 	Rev         int64            `json:"rev"`
 	Assignments []api.Assignment `json:"assignments"`
 }
@@ -150,6 +199,10 @@ func (c *Client) ListRoutes(ctx context.Context) ([]api.Route, error) {
 func (c *Client) Leader(ctx context.Context) (api.Lease, error) {
 	var out api.Lease
 	err := c.get(ctx, "/v1/leader", &out)
+	if err == nil && len(out.Controllers) == 3 {
+		c.SetControllers(out.Controllers)
+		c.selectEndpoint(out.URL)
+	}
 	return out, err
 }
 
@@ -207,6 +260,11 @@ func (c *Client) GetImage(ctx context.Context, ref string) (io.ReadCloser, error
 }
 
 func (c *Client) PutImage(ctx context.Context, ref string, r io.Reader) error {
+	if len(c.Controllers()) > 0 {
+		if _, err := c.Leader(ctx); err != nil {
+			return err
+		}
+	}
 	resp, err := c.do(ctx, http.MethodPut, "/v1/images?ref="+url.QueryEscape(ref), r)
 	if err != nil {
 		return err
@@ -301,17 +359,151 @@ func (c *Client) post(ctx context.Context, path string, body any, dest any) erro
 }
 
 func (c *Client) do(ctx context.Context, method, path string, body io.Reader) (*http.Response, error) {
-	req, err := http.NewRequestWithContext(ctx, method, c.Base+path, body)
+	req, err := http.NewRequestWithContext(ctx, method, c.Endpoint()+path, body)
 	if err != nil {
 		return nil, err
 	}
 	if c.Token != "" {
 		req.Header.Set("Authorization", "Bearer "+c.Token)
 	}
-	if c.HTTP == nil {
-		c.HTTP = http.DefaultClient
+	if method == http.MethodPost || method == http.MethodPut {
+		req.Header.Set("X-Tessera-Request-ID", api.NewID())
 	}
-	return c.HTTP.Do(req)
+	if method == http.MethodPost && body != nil {
+		req.Header.Set("Content-Type", "application/json")
+	}
+	httpClient := http.DefaultClient
+	if c.HTTP != nil {
+		httpClient = c.HTTP
+	}
+	cloned := *httpClient
+	cloned.CheckRedirect = func(*http.Request, []*http.Request) error { return http.ErrUseLastResponse }
+	queue := append([]string{c.Endpoint()}, c.Controllers()...)
+	visited := map[string]bool{}
+	var last error
+	attempt := 0
+	retryUntil := time.Time{}
+	if len(c.Controllers()) > 0 {
+		retryUntil = time.Now().Add(5 * time.Second)
+	}
+	for {
+		if len(queue) == 0 {
+			if retryUntil.IsZero() || !time.Now().Before(retryUntil) || (req.Body != nil && req.GetBody == nil) {
+				break
+			}
+			timer := time.NewTimer(100 * time.Millisecond)
+			select {
+			case <-ctx.Done():
+				timer.Stop()
+				return nil, ctx.Err()
+			case <-timer.C:
+			}
+			visited = map[string]bool{}
+			queue = append([]string{c.Endpoint()}, c.Controllers()...)
+		}
+		endpoint := queue[0]
+		queue = queue[1:]
+		if visited[endpoint] {
+			continue
+		}
+		visited[endpoint] = true
+		current := req.Clone(ctx)
+		current.URL, err = url.Parse(endpoint + path)
+		if err != nil {
+			return nil, err
+		}
+		if attempt > 0 && req.Body != nil {
+			if req.GetBody == nil {
+				return nil, last
+			}
+			current.Body, err = req.GetBody()
+			if err != nil {
+				return nil, err
+			}
+		}
+		attempt++
+		attemptCtx := ctx
+		cancel := func() {}
+		if len(c.Controllers()) > 0 {
+			duration := 3 * time.Second
+			waitMS, _ := strconv.ParseInt(current.URL.Query().Get("wait_ms"), 10, 64)
+			if waitMS > 0 && waitMS <= 60000 {
+				duration += time.Duration(waitMS) * time.Millisecond
+			}
+			attemptCtx, cancel = context.WithTimeout(ctx, duration)
+			current = current.WithContext(attemptCtx)
+		}
+		response, requestErr := cloned.Do(current)
+		if requestErr != nil {
+			cancel()
+			last = requestErr
+			if ctx.Err() != nil {
+				return nil, ctx.Err()
+			}
+			queue = append(queue, c.Controllers()...)
+			continue
+		}
+		var controllers []string
+		if json.Unmarshal([]byte(response.Header.Get("X-Tessera-Controllers")), &controllers) == nil {
+			c.SetControllers(controllers)
+			if retryUntil.IsZero() && len(c.Controllers()) > 0 {
+				retryUntil = time.Now().Add(5 * time.Second)
+			}
+		}
+		if response.StatusCode == http.StatusTemporaryRedirect || response.StatusCode == http.StatusServiceUnavailable {
+			if req.Body != nil && req.GetBody == nil {
+				response.Body = &responseBody{ReadCloser: response.Body, cancel: cancel}
+				return response, nil
+			}
+			message, _ := io.ReadAll(io.LimitReader(response.Body, 1024))
+			response.Body.Close()
+			cancel()
+			last = fmt.Errorf("%s %s: %s", method, path, strings.TrimSpace(string(message)))
+			if location, err := url.Parse(response.Header.Get("Location")); err == nil && location.Host != "" {
+				target := location.Scheme + "://" + location.Host
+				for _, peer := range c.Controllers() {
+					if target == peer {
+						queue = append([]string{peer}, queue...)
+					}
+				}
+			}
+			queue = append(queue, c.Controllers()...)
+			continue
+		}
+		if response.StatusCode < 300 {
+			c.mu.Lock()
+			c.Base = endpoint
+			c.mu.Unlock()
+		}
+		response.Body = &responseBody{ReadCloser: response.Body, cancel: cancel}
+		return response, nil
+	}
+	if last == nil {
+		last = fmt.Errorf("no controller reachable")
+	}
+	return nil, last
+}
+
+func (c *Client) selectEndpoint(value string) {
+	for _, peer := range c.Controllers() {
+		if peer == value {
+			c.mu.Lock()
+			c.Base = value
+			c.mu.Unlock()
+			return
+		}
+	}
+}
+
+type responseBody struct {
+	io.ReadCloser
+	cancel context.CancelFunc
+}
+
+func (r *responseBody) Close() error {
+	err := r.ReadCloser.Close()
+	r.cancel()
+	return err
 }
 
 func (c *Client) call(ctx context.Context, method, path string, body []byte, auth bool) ([]byte, error) {
@@ -319,22 +511,15 @@ func (c *Client) call(ctx context.Context, method, path string, body []byte, aut
 	if body != nil {
 		r = bytes.NewReader(body)
 	}
-	req, err := http.NewRequestWithContext(ctx, method, c.Base+path, r)
-	if err != nil {
-		return nil, err
-	}
-	if body != nil {
-		req.Header.Set("Content-Type", "application/json")
-	}
-	if auth && c.Token != "" {
-		req.Header.Set("Authorization", "Bearer "+c.Token)
-	}
-	resp, err := c.HTTP.Do(req)
+	resp, err := c.do(ctx, method, path, r)
 	if err != nil {
 		return nil, err
 	}
 	defer resp.Body.Close()
-	b, _ := io.ReadAll(io.LimitReader(resp.Body, 8<<20))
+	b, err := io.ReadAll(io.LimitReader(resp.Body, 8<<20))
+	if err != nil {
+		return nil, err
+	}
 	if resp.StatusCode >= 300 {
 		return nil, fmt.Errorf("%s %s: %s", method, path, strings.TrimSpace(string(b)))
 	}

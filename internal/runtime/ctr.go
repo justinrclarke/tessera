@@ -54,6 +54,9 @@ func (c *CTR) args(sub ...string) []string {
 }
 
 func (c *CTR) Start(ctx context.Context, spec Spec) (Container, error) {
+	if spec.GPUs > 0 {
+		return Container{}, &StartError{Reason: "GPU workloads require Docker with the NVIDIA Container Toolkit"}
+	}
 	if c.look == nil {
 		c.look = lookBin
 	}

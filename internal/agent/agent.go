@@ -17,6 +17,7 @@ import (
 	"tessera/internal/client"
 	"tessera/internal/controller"
 	"tessera/internal/discover"
+	"tessera/internal/gpu"
 	"tessera/internal/host"
 	"tessera/internal/runtime"
 	"tessera/internal/store"
@@ -37,17 +38,23 @@ type Agent struct {
 	Others      int
 	PeerIDs     []string
 	Reexec      func() error
+	GPUProbe    func(context.Context) ([]api.GPU, error)
+	Labels      map[string]string
 
 	maxEpoch  uint64
 	snapIndex uint64
+	snapEpoch uint64
 	restarts  map[string]int
 	rev       int64
 	promoted  *controller.Server
 	perfAt    time.Time
 	perfScore api.Perf
+	gpuAt     time.Time
+	gpuItems  []api.GPU
 }
 
 type diskCache struct {
+	Controllers []string         `json:"controllers,omitempty"`
 	NodeID      string           `json:"node_id"`
 	Assignments []api.Assignment `json:"assignments"`
 	Snapshot    api.Snapshot     `json:"snapshot"`
@@ -85,6 +92,12 @@ func (a *Agent) Run(ctx context.Context) error {
 			_, _ = a.maybePromote(ctx)
 			continue
 		}
+		if page.Epoch != 0 && !survive.AcceptAssignment(a.maxEpoch, page.Epoch) {
+			continue
+		}
+		if err := a.observeEpoch(page.Epoch); err != nil {
+			return err
+		}
 		a.rev = page.Rev
 		if err := a.converge(ctx, page.Assignments, true); err != nil {
 			return err
@@ -100,15 +113,25 @@ func (a *Agent) Tick(ctx context.Context) error {
 	if err := a.ensureRegistered(ctx); err != nil {
 		return err
 	}
+	if controllers := a.Client.Controllers(); len(controllers) > 0 {
+		c, err := a.readCache()
+		if err != nil && !os.IsNotExist(err) {
+			return err
+		}
+		c.Controllers = controllers
+		if err := a.writeCache(c); err != nil {
+			return err
+		}
+	}
 	hb, err := a.Client.Heartbeat(ctx, a.ID, a.reportHost())
 	if err != nil {
 		return err
 	}
-	if hb.Epoch > a.maxEpoch {
-		a.maxEpoch = hb.Epoch
+	if !survive.AcceptAssignment(a.maxEpoch, hb.Epoch) {
+		return fmt.Errorf("stale heartbeat epoch")
 	}
-	if hb.Command != nil {
-		return a.execCommand(ctx, hb.Command)
+	if err := a.observeEpoch(hb.Epoch); err != nil {
+		return err
 	}
 	if !hb.Leading {
 		return fmt.Errorf("leader not leading")
@@ -116,17 +139,26 @@ func (a *Agent) Tick(ctx context.Context) error {
 	if survive.Expired(survive.Lease{Epoch: hb.Epoch, LeaderID: hb.LeaderID, Expires: hb.Expires}, a.now()) {
 		return fmt.Errorf("lease expired")
 	}
+	if hb.Command != nil {
+		return a.execCommand(ctx, hb.Command)
+	}
 	if hb.Prune && a.Runtime != nil {
 		_ = a.Runtime.Prune(ctx)
 	}
 	if hb.CertPEM != "" {
 		_ = a.saveCert(hb.CertPEM, hb.KeyPEM)
 	}
-	if hb.SnapshotIndex > a.snapIndex {
+	if hb.SnapshotIndex > a.snapIndex || hb.Epoch > a.snapEpoch {
 		_ = a.fetchSnapshot(ctx)
 	}
 	page, err := a.Client.WaitAssignments(ctx, a.ID, a.rev, 0)
 	if err != nil {
+		return err
+	}
+	if page.Epoch != 0 && !survive.AcceptAssignment(a.maxEpoch, page.Epoch) {
+		return fmt.Errorf("stale assignment page")
+	}
+	if err := a.observeEpoch(page.Epoch); err != nil {
 		return err
 	}
 	a.rev = page.Rev
@@ -134,6 +166,20 @@ func (a *Agent) Tick(ctx context.Context) error {
 }
 
 func (a *Agent) SetEpoch(epoch uint64) { a.maxEpoch = epoch }
+
+func (a *Agent) observeEpoch(epoch uint64) error {
+	if epoch <= a.maxEpoch {
+		return nil
+	}
+	c, err := a.readCache()
+	if err != nil && !os.IsNotExist(err) {
+		return err
+	}
+	a.maxEpoch = epoch
+	c.Epoch = epoch
+	c.NodeID = a.ID
+	return a.writeCache(c)
+}
 
 func (a *Agent) SaveForTest(asgs []api.Assignment) error {
 	a.init()
@@ -154,6 +200,12 @@ func (a *Agent) maybePromote(ctx context.Context) (bool, error) {
 	if a.promoted != nil {
 		return true, nil
 	}
+	if a.Client != nil && len(a.Client.Controllers()) > 0 {
+		return false, nil
+	}
+	if c, err := a.readCache(); err == nil && len(c.Controllers) > 0 {
+		return false, nil
+	}
 	if a.Client != nil {
 		if lease, err := a.Client.Leader(ctx); err == nil && lease.Leading && !survive.Expired(survive.Lease{Epoch: lease.Epoch, LeaderID: lease.LeaderID, Expires: lease.Expires}, a.now()) {
 			return false, nil
@@ -162,6 +214,9 @@ func (a *Agent) maybePromote(ctx context.Context) (bool, error) {
 	snap, err := a.loadSnapshot()
 	if err != nil || snap.Index == 0 {
 		return false, err
+	}
+	if len(snap.Controllers) > 0 {
+		return false, nil
 	}
 	epoch := a.maxEpoch
 	if snap.Epoch > epoch {
@@ -214,9 +269,15 @@ func (a *Agent) restore(ctx context.Context) error {
 	if c.NodeID != "" {
 		a.ID = c.NodeID
 	}
-	a.maxEpoch = c.Epoch
+	if c.Epoch > a.maxEpoch {
+		a.maxEpoch = c.Epoch
+	}
+	if a.Client != nil {
+		a.Client.SetControllers(c.Controllers)
+	}
 	if c.Snapshot.Index > 0 {
 		a.snapIndex = c.Snapshot.Index
+		a.snapEpoch = c.Snapshot.Epoch
 	}
 	if a.Runtime == nil {
 		return nil
@@ -243,6 +304,8 @@ func (a *Agent) converge(ctx context.Context, desired []api.Assignment, live boo
 			continue
 		}
 		if !survive.AcceptAssignment(a.maxEpoch, d.Epoch) {
+			want[d.ID] = true
+			keep = append(keep, d)
 			continue
 		}
 		name := "tessera_" + d.ID
@@ -277,7 +340,7 @@ func (a *Agent) converge(ctx context.Context, desired []api.Assignment, live boo
 		}
 		a.ensureImage(ctx, d.Image)
 		started, err := a.Runtime.Start(ctx, runtime.Spec{
-			Name: name, Image: d.Image, Command: d.Command, Env: d.Env, Ports: d.Ports, Resources: d.Resources, GPUs: d.GPUs,
+			Name: name, Image: d.Image, Command: d.Command, Env: d.Env, Ports: d.Ports, Resources: d.Resources, GPUs: d.GPUs, GPUDevices: d.GPUDevices,
 		})
 		if err != nil {
 			reason := err.Error()
@@ -313,6 +376,7 @@ func (a *Agent) report(ctx context.Context, d api.Assignment, status, reason str
 		logs, _ = a.Runtime.Logs(ctx, c.ID)
 	}
 	_ = a.Client.Report(ctx, d.ID, client.StatusReport{
+		Epoch:  d.Epoch,
 		Status: status, Reason: reason, Restarts: a.restarts[d.ID], RuntimeID: c.ID, HostPort: c.HostPort, Logs: logs,
 	})
 }
@@ -326,8 +390,9 @@ func (a *Agent) ensureRegistered(ctx context.Context) error {
 			a.ID = "node-" + api.NewID()
 		}
 	}
+	items := a.gpuInventory()
 	_, err := a.Client.Register(ctx, client.RegisterRequest{
-		ID: a.ID, Addr: a.addr(), Capacity: a.capacity(), Free: a.free(), Perf: a.perf(), DiskFree: a.diskFree(), DiskTotal: a.diskTotal(),
+		ID: a.ID, Addr: a.addr(), Capacity: a.capacity(), Free: a.free(), Perf: a.perf(), GPUs: len(items), GPUInventory: items, DiskFree: a.diskFree(), DiskTotal: a.diskTotal(), Labels: a.Labels,
 	})
 	return err
 }
@@ -337,18 +402,26 @@ func (a *Agent) fetchSnapshot(ctx context.Context) error {
 	if err != nil {
 		return err
 	}
-	if signed.Snapshot.Index == 0 {
+	if signed.Snapshot.Index == 0 && signed.Body == "" {
 		return nil
 	}
-	if signed.Body != "" && signed.Sig != "" && !survive.Verify(a.Token, []byte(signed.Body), signed.Sig) {
+	if signed.Body == "" || signed.Sig == "" || !survive.Verify(a.Token, []byte(signed.Body), signed.Sig) {
 		return fmt.Errorf("snapshot signature mismatch")
 	}
+	if err := json.Unmarshal([]byte(signed.Body), &signed.Snapshot); err != nil {
+		return err
+	}
+	if !survive.AcceptAssignment(a.maxEpoch, signed.Snapshot.Epoch) || (signed.Snapshot.Epoch == a.snapEpoch && signed.Snapshot.Index < a.snapIndex) {
+		return fmt.Errorf("stale snapshot")
+	}
 	a.snapIndex = signed.Snapshot.Index
+	a.snapEpoch = signed.Snapshot.Epoch
 	if signed.Snapshot.Epoch > a.maxEpoch {
 		a.maxEpoch = signed.Snapshot.Epoch
 	}
 	c, _ := a.readCache()
 	c.Snapshot = signed.Snapshot
+	c.Controllers = signed.Snapshot.Controllers
 	c.SnapBody = signed.Body
 	c.Sig = signed.Sig
 	c.Epoch = a.maxEpoch
@@ -361,10 +434,17 @@ func (a *Agent) loadSnapshot() (api.Snapshot, error) {
 	if err != nil {
 		return api.Snapshot{}, err
 	}
-	if c.Sig != "" && c.SnapBody != "" && a.Token != "" && !survive.Verify(a.Token, []byte(c.SnapBody), c.Sig) {
+	if c.Snapshot.Index == 0 && c.SnapBody == "" {
+		return c.Snapshot, nil
+	}
+	if c.Sig == "" || c.SnapBody == "" || !survive.Verify(a.Token, []byte(c.SnapBody), c.Sig) {
 		return api.Snapshot{}, fmt.Errorf("snapshot signature mismatch")
 	}
-	return c.Snapshot, nil
+	var snapshot api.Snapshot
+	if err := json.Unmarshal([]byte(c.SnapBody), &snapshot); err != nil {
+		return api.Snapshot{}, err
+	}
+	return snapshot, nil
 }
 
 func (a *Agent) saveCache(desired []api.Assignment) error {
@@ -372,6 +452,9 @@ func (a *Agent) saveCache(desired []api.Assignment) error {
 	c.NodeID = a.ID
 	c.Assignments = desired
 	c.Epoch = a.maxEpoch
+	if a.Client != nil && len(a.Client.Controllers()) > 0 {
+		c.Controllers = a.Client.Controllers()
+	}
 	return a.writeCache(c)
 }
 
@@ -445,9 +528,29 @@ func (a *Agent) max() int {
 
 func (a *Agent) reportHost() client.HeartbeatRequest {
 	cap, free, diskTotal, diskFree := host.Resources(a.DataDir)
+	items := a.gpuInventory()
 	return client.HeartbeatRequest{
-		Addr: a.addr(), Capacity: cap, Free: free, Perf: a.perf(), DiskFree: diskFree, DiskTotal: diskTotal,
+		Addr: a.addr(), Capacity: cap, Free: free, Perf: a.perf(), GPUs: len(items), GPUInventory: items, DiskFree: diskFree, DiskTotal: diskTotal,
 	}
+}
+
+func (a *Agent) gpuInventory() []api.GPU {
+	if !a.gpuAt.IsZero() && a.now().Sub(a.gpuAt) < 30*time.Second {
+		return a.gpuItems
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+	probe := a.GPUProbe
+	if probe == nil {
+		probe = func(ctx context.Context) ([]api.GPU, error) { return gpu.Detect(ctx, nil) }
+	}
+	items, err := probe(ctx)
+	if err != nil {
+		items = nil
+	}
+	a.gpuItems = items
+	a.gpuAt = a.now()
+	return items
 }
 
 func (a *Agent) capacity() api.Resources {

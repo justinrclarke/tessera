@@ -40,6 +40,14 @@ func (s *Server) handleHealth(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Server) handleLeader(w http.ResponseWriter, r *http.Request) {
+	if s.replica != nil {
+		_, id := s.replica.raft.LeaderWithID()
+		s.mu.Lock()
+		epoch, expires := s.epoch, s.expires
+		s.mu.Unlock()
+		writeJSON(w, http.StatusOK, api.Lease{Epoch: epoch, Expires: expires, LeaderID: string(id), Leading: s.Leading(), URL: s.replica.leaderURL(), Controllers: s.controllerURLs()})
+		return
+	}
 	s.mu.Lock()
 	lease := api.Lease{Epoch: s.epoch, LeaderID: s.ID, Expires: s.expires, Leading: s.leading, URL: s.URL}
 	s.mu.Unlock()
@@ -192,7 +200,7 @@ func (s *Server) handleRegister(w http.ResponseWriter, r *http.Request) {
 	}
 	n := api.Node{
 		ID: req.ID, Addr: req.Addr, Status: api.NodeReady,
-		Capacity: req.Capacity, Free: req.Free, Perf: req.Perf, Score: req.Perf.CPU, GPUs: req.GPUs,
+		Capacity: req.Capacity, Free: req.Free, Perf: req.Perf, Score: req.Perf.CPU, GPUs: req.GPUs, GPUInventory: req.GPUInventory,
 		Labels: req.Labels, LastSeen: now, DiskFree: req.DiskFree, DiskTotal: req.DiskTotal,
 		CertNotBefore: cert.NotBefore, CertNotAfter: cert.NotAfter, Epoch: s.Epoch(),
 	}
@@ -236,6 +244,7 @@ func (s *Server) handleHeartbeat(w http.ResponseWriter, r *http.Request) {
 	n.Perf = req.Perf
 	n.Score = req.Perf.CPU
 	n.GPUs = req.GPUs
+	n.GPUInventory = req.GPUInventory
 	n.DiskFree = req.DiskFree
 	n.DiskTotal = req.DiskTotal
 	resp := client.HeartbeatResponse{Epoch: s.epoch, LeaderID: s.ID, Expires: s.expires, Leading: s.leading}
@@ -304,7 +313,7 @@ func (s *Server) handleAssignments(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 	}
-	page := client.Page{Rev: s.rev, Assignments: s.assignmentsForLocked(id)}
+	page := client.Page{Rev: s.rev, Epoch: s.epoch, Assignments: s.assignmentsForLocked(id)}
 	s.mu.Unlock()
 	writeJSON(w, http.StatusOK, page)
 }
@@ -350,6 +359,11 @@ func (s *Server) handleStatus(w http.ResponseWriter, r *http.Request) {
 	id := r.PathValue("id")
 	now := s.now()
 	s.mu.Lock()
+	if rep.Epoch != 0 && rep.Epoch != s.epoch {
+		s.mu.Unlock()
+		http.Error(w, "stale assignment epoch", http.StatusConflict)
+		return
+	}
 	asg, err := s.Store.GetAssignment(id)
 	if err != nil {
 		s.mu.Unlock()
@@ -687,6 +701,9 @@ func (s *Server) explain(question string) (string, error) {
 }
 
 func (s *Server) leadingNow() bool {
+	if s.replica != nil {
+		return s.Leading()
+	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	return s.leading

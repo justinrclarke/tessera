@@ -4,9 +4,11 @@ import (
 	"database/sql"
 	"encoding/json"
 	"fmt"
+	"io"
 	"net/url"
 	"os"
 	"path/filepath"
+	"strconv"
 	"time"
 
 	"tessera/internal/api"
@@ -16,7 +18,9 @@ import (
 )
 
 type Store struct {
-	db *sql.DB
+	db         *sql.DB
+	tx         *sql.Tx
+	statements *[]Statement
 }
 
 func Open(path string) (*Store, error) {
@@ -39,8 +43,14 @@ func Open(path string) (*Store, error) {
 
 func (s *Store) Close() error { return s.db.Close() }
 
+func (s *Store) HasResources() (bool, error) {
+	var count int
+	err := s.queryRow(`SELECT (SELECT COUNT(*) FROM apps)+(SELECT COUNT(*) FROM nodes)+(SELECT COUNT(*) FROM assignments)+(SELECT COUNT(*) FROM routes)+(SELECT COUNT(*) FROM configs)+(SELECT COUNT(*) FROM actions)+(SELECT COUNT(*) FROM app_history)`).Scan(&count)
+	return count > 0, err
+}
+
 func (s *Store) migrate() error {
-	_, err := s.db.Exec(`
+	_, err := s.exec(`
 CREATE TABLE IF NOT EXISTS apps (name TEXT PRIMARY KEY, body TEXT NOT NULL, generation INTEGER NOT NULL);
 CREATE TABLE IF NOT EXISTS app_history (name TEXT NOT NULL, generation INTEGER NOT NULL, body TEXT NOT NULL, PRIMARY KEY (name, generation));
 CREATE TABLE IF NOT EXISTS nodes (id TEXT PRIMARY KEY, body TEXT NOT NULL, last_seen INTEGER NOT NULL, status TEXT NOT NULL);
@@ -83,14 +93,14 @@ func (s *Store) putHistory(a api.App) error {
 	if err != nil {
 		return err
 	}
-	_, err = s.db.Exec(`INSERT INTO app_history(name, generation, body) VALUES(?, ?, ?)
+	_, err = s.exec(`INSERT INTO app_history(name, generation, body) VALUES(?, ?, ?)
 		ON CONFLICT(name, generation) DO UPDATE SET body=excluded.body`, a.Name, a.Generation, string(b))
 	return err
 }
 
 func (s *Store) History(name string, generation int64) (api.App, error) {
 	var body string
-	err := s.db.QueryRow(`SELECT body FROM app_history WHERE name=? AND generation=?`, name, generation).Scan(&body)
+	err := s.queryRow(`SELECT body FROM app_history WHERE name=? AND generation=?`, name, generation).Scan(&body)
 	if err != nil {
 		return api.App{}, err
 	}
@@ -108,7 +118,7 @@ func (s *Store) ListApps() ([]api.App, error) {
 }
 
 func (s *Store) DeleteApp(name string) error {
-	_, err := s.db.Exec(`DELETE FROM apps WHERE name=?`, name)
+	_, err := s.exec(`DELETE FROM apps WHERE name=?`, name)
 	return err
 }
 
@@ -125,7 +135,7 @@ func (s *Store) MarkHealthy(name string, generation int64) error {
 	if err != nil {
 		return err
 	}
-	_, err = s.db.Exec(`UPDATE apps SET body=?, generation=? WHERE name=?`, string(b), a.Generation, name)
+	_, err = s.exec(`UPDATE apps SET body=?, generation=? WHERE name=?`, string(b), a.Generation, name)
 	return err
 }
 
@@ -147,7 +157,7 @@ func (s *Store) Rollback(name string) (api.App, error) {
 	if err != nil {
 		return api.App{}, err
 	}
-	_, err = s.db.Exec(`UPDATE apps SET body=?, generation=? WHERE name=?`, string(b), old.Generation, name)
+	_, err = s.exec(`UPDATE apps SET body=?, generation=? WHERE name=?`, string(b), old.Generation, name)
 	return old, err
 }
 
@@ -156,7 +166,7 @@ func (s *Store) PutNode(n api.Node) error {
 	if err != nil {
 		return err
 	}
-	_, err = s.db.Exec(`INSERT INTO nodes(id, body, last_seen, status) VALUES(?, ?, ?, ?)
+	_, err = s.exec(`INSERT INTO nodes(id, body, last_seen, status) VALUES(?, ?, ?, ?)
 		ON CONFLICT(id) DO UPDATE SET body=excluded.body, last_seen=excluded.last_seen, status=excluded.status`,
 		n.ID, string(b), n.LastSeen.UnixMilli(), n.Status)
 	return err
@@ -171,7 +181,7 @@ func (s *Store) ListNodes() ([]api.Node, error) {
 }
 
 func (s *Store) DeleteNode(id string) error {
-	_, err := s.db.Exec(`DELETE FROM nodes WHERE id=?`, id)
+	_, err := s.exec(`DELETE FROM nodes WHERE id=?`, id)
 	return err
 }
 
@@ -183,7 +193,7 @@ func (s *Store) PutAssignment(a api.Assignment) error {
 	if err != nil {
 		return err
 	}
-	_, err = s.db.Exec(`INSERT INTO assignments(id, app, node_id, body, status) VALUES(?, ?, ?, ?, ?)
+	_, err = s.exec(`INSERT INTO assignments(id, app, node_id, body, status) VALUES(?, ?, ?, ?, ?)
 		ON CONFLICT(id) DO UPDATE SET app=excluded.app, node_id=excluded.node_id, body=excluded.body, status=excluded.status`,
 		a.ID, a.App, a.NodeID, string(b), a.Status)
 	return err
@@ -205,7 +215,7 @@ func (s *Store) AddAction(a api.Action) error {
 	if err != nil {
 		return err
 	}
-	_, err = s.db.Exec(`INSERT INTO actions(id, at, body) VALUES(?, ?, ?)`, a.ID, a.At.UnixMilli(), string(b))
+	_, err = s.exec(`INSERT INTO actions(id, at, body) VALUES(?, ?, ?)`, a.ID, a.At.UnixMilli(), string(b))
 	return err
 }
 
@@ -213,7 +223,7 @@ func (s *Store) ListActions(limit int) ([]api.Action, error) {
 	if limit <= 0 {
 		limit = 50
 	}
-	rows, err := s.db.Query(`SELECT body FROM actions ORDER BY at DESC LIMIT ?`, limit)
+	rows, err := s.query(`SELECT body FROM actions ORDER BY at DESC LIMIT ?`, limit)
 	if err != nil {
 		return nil, err
 	}
@@ -235,7 +245,7 @@ func (s *Store) ListActions(limit int) ([]api.Action, error) {
 
 func (s *Store) GetAction(id string) (api.Action, error) {
 	var body string
-	err := s.db.QueryRow(`SELECT body FROM actions WHERE id=?`, id).Scan(&body)
+	err := s.queryRow(`SELECT body FROM actions WHERE id=?`, id).Scan(&body)
 	if err != nil {
 		return api.Action{}, err
 	}
@@ -257,12 +267,12 @@ func (s *Store) UpdateAction(a api.Action) error {
 	if err != nil {
 		return err
 	}
-	_, err = s.db.Exec(`UPDATE actions SET body=? WHERE id=?`, string(b), a.ID)
+	_, err = s.exec(`UPDATE actions SET body=? WHERE id=?`, string(b), a.ID)
 	return err
 }
 
 func (s *Store) HasAction(kind, target, reason string) (bool, error) {
-	rows, err := s.db.Query(`SELECT body FROM actions ORDER BY at DESC LIMIT 200`)
+	rows, err := s.query(`SELECT body FROM actions ORDER BY at DESC LIMIT 200`)
 	if err != nil {
 		return false, err
 	}
@@ -296,7 +306,7 @@ func (s *Store) PutConfig(c api.Config) error {
 	if err != nil {
 		return err
 	}
-	_, err = s.db.Exec(`INSERT INTO configs(name, kind, body) VALUES(?, ?, ?)
+	_, err = s.exec(`INSERT INTO configs(name, kind, body) VALUES(?, ?, ?)
 		ON CONFLICT(name, kind) DO UPDATE SET body=excluded.body`, c.Name, api.KindConfig, string(b))
 	return err
 }
@@ -306,14 +316,14 @@ func (s *Store) PutSecret(sec api.Secret) error {
 	if err != nil {
 		return err
 	}
-	_, err = s.db.Exec(`INSERT INTO configs(name, kind, body) VALUES(?, ?, ?)
+	_, err = s.exec(`INSERT INTO configs(name, kind, body) VALUES(?, ?, ?)
 		ON CONFLICT(name, kind) DO UPDATE SET body=excluded.body`, sec.Name, api.KindSecret, string(b))
 	return err
 }
 
 func (s *Store) GetConfig(name string) (api.Config, error) {
 	var body string
-	err := s.db.QueryRow(`SELECT body FROM configs WHERE name=? AND kind=?`, name, api.KindConfig).Scan(&body)
+	err := s.queryRow(`SELECT body FROM configs WHERE name=? AND kind=?`, name, api.KindConfig).Scan(&body)
 	if err != nil {
 		return api.Config{}, err
 	}
@@ -324,7 +334,7 @@ func (s *Store) GetConfig(name string) (api.Config, error) {
 
 func (s *Store) GetSecret(name string) (api.Secret, error) {
 	var body string
-	err := s.db.QueryRow(`SELECT body FROM configs WHERE name=? AND kind=?`, name, api.KindSecret).Scan(&body)
+	err := s.queryRow(`SELECT body FROM configs WHERE name=? AND kind=?`, name, api.KindSecret).Scan(&body)
 	if err != nil {
 		return api.Secret{}, err
 	}
@@ -364,7 +374,7 @@ func (s *Store) Policy() (api.Policy, error) {
 
 func (s *Store) Meta(key string) (string, error) {
 	var v string
-	err := s.db.QueryRow(`SELECT value FROM meta WHERE key=?`, key).Scan(&v)
+	err := s.queryRow(`SELECT value FROM meta WHERE key=?`, key).Scan(&v)
 	if err == sql.ErrNoRows {
 		return "", nil
 	}
@@ -372,7 +382,7 @@ func (s *Store) Meta(key string) (string, error) {
 }
 
 func (s *Store) SetMeta(key, value string) error {
-	_, err := s.db.Exec(`INSERT INTO meta(key, value) VALUES(?, ?) ON CONFLICT(key) DO UPDATE SET value=excluded.value`, key, value)
+	_, err := s.exec(`INSERT INTO meta(key, value) VALUES(?, ?) ON CONFLICT(key) DO UPDATE SET value=excluded.value`, key, value)
 	return err
 }
 
@@ -385,13 +395,13 @@ func (s *Store) AppendSnapshot(snap api.Snapshot, sig string) error {
 }
 
 func (s *Store) AppendSnapshotRaw(idx uint64, body, sig string) error {
-	_, err := s.db.Exec(`INSERT INTO snapshots(idx, body, sig) VALUES(?, ?, ?)`, idx, body, sig)
+	_, err := s.exec(`INSERT INTO snapshots(idx, body, sig) VALUES(?, ?, ?)`, idx, body, sig)
 	return err
 }
 
 func (s *Store) RawSnapshot() (string, string, error) {
 	var body, sig string
-	err := s.db.QueryRow(`SELECT body, sig FROM snapshots ORDER BY idx DESC LIMIT 1`).Scan(&body, &sig)
+	err := s.queryRow(`SELECT body, sig FROM snapshots ORDER BY idx DESC LIMIT 1`).Scan(&body, &sig)
 	if err == sql.ErrNoRows {
 		return "", "", nil
 	}
@@ -400,7 +410,7 @@ func (s *Store) RawSnapshot() (string, string, error) {
 
 func (s *Store) LatestSnapshot() (api.Snapshot, string, error) {
 	var body, sig string
-	err := s.db.QueryRow(`SELECT body, sig FROM snapshots ORDER BY idx DESC LIMIT 1`).Scan(&body, &sig)
+	err := s.queryRow(`SELECT body, sig FROM snapshots ORDER BY idx DESC LIMIT 1`).Scan(&body, &sig)
 	if err == sql.ErrNoRows {
 		return api.Snapshot{}, "", nil
 	}
@@ -420,7 +430,7 @@ func (s *Store) LoadSnapshot(snap api.Snapshot, epoch uint64) error {
 		if err != nil {
 			return err
 		}
-		if _, err := s.db.Exec(`INSERT INTO apps(name, body, generation) VALUES(?, ?, ?)
+		if _, err := s.exec(`INSERT INTO apps(name, body, generation) VALUES(?, ?, ?)
 			ON CONFLICT(name) DO UPDATE SET body=excluded.body, generation=excluded.generation`, a.Name, string(b), a.Generation); err != nil {
 			return err
 		}
@@ -451,8 +461,120 @@ func (s *Store) LoadSnapshot(snap api.Snapshot, epoch uint64) error {
 
 func (s *Store) Backup(path string) error {
 	q := fmt.Sprintf("VACUUM INTO '%s'", escape(path))
-	_, err := s.db.Exec(q)
+	_, err := s.exec(q)
 	return err
+}
+
+func BackupFile(source, target string) error {
+	sourceURL := url.URL{Scheme: "file", Path: source, RawQuery: "mode=ro"}
+	reader, err := sql.Open("sqlite", sourceURL.String())
+	if err != nil {
+		return err
+	}
+	defer reader.Close()
+	reader.SetMaxOpenConns(1)
+	_, err = reader.Exec(fmt.Sprintf("VACUUM INTO '%s'", escape(target)))
+	return err
+}
+
+func RestoreBackup(source, target string, minEpoch uint64) error {
+	if minEpoch == ^uint64(0) {
+		return fmt.Errorf("restore epoch leaves no room for promotion")
+	}
+	if _, err := os.Stat(target); err == nil {
+		return fmt.Errorf("restore target already exists: %s", target)
+	} else if !os.IsNotExist(err) {
+		return err
+	}
+	sourceURL := url.URL{Scheme: "file", Path: source, RawQuery: "mode=ro"}
+	reader, err := sql.Open("sqlite", sourceURL.String())
+	if err != nil {
+		return err
+	}
+	defer reader.Close()
+	var check string
+	if err := reader.QueryRow(`PRAGMA quick_check`).Scan(&check); err != nil {
+		return fmt.Errorf("invalid backup: %w", err)
+	}
+	if check != "ok" {
+		return fmt.Errorf("invalid backup: %s", check)
+	}
+	var epochText, token string
+	if err := reader.QueryRow(`SELECT value FROM meta WHERE key='epoch'`).Scan(&epochText); err != nil {
+		return fmt.Errorf("backup has no epoch: %w", err)
+	}
+	if err := reader.QueryRow(`SELECT value FROM meta WHERE key='token'`).Scan(&token); err != nil {
+		return fmt.Errorf("backup has no token: %w", err)
+	}
+	if token == "" {
+		return fmt.Errorf("backup has no token")
+	}
+	epoch, err := strconv.ParseUint(epochText, 10, 64)
+	if err != nil || epoch == ^uint64(0) {
+		return fmt.Errorf("invalid backup epoch %q", epochText)
+	}
+	epoch++
+	if minEpoch > epoch {
+		epoch = minEpoch
+	}
+	if err := os.MkdirAll(filepath.Dir(target), 0o700); err != nil {
+		return err
+	}
+	input, err := os.Open(source)
+	if err != nil {
+		return err
+	}
+	defer input.Close()
+	output, err := os.CreateTemp(filepath.Dir(target), ".tessera-restore-*.db")
+	if err != nil {
+		return err
+	}
+	temp := output.Name()
+	defer os.Remove(temp)
+	if err := output.Chmod(0o600); err != nil {
+		output.Close()
+		return err
+	}
+	if _, err := io.Copy(output, input); err != nil {
+		output.Close()
+		return err
+	}
+	if err := output.Sync(); err != nil {
+		output.Close()
+		return err
+	}
+	if err := output.Close(); err != nil {
+		return err
+	}
+	targetURL := url.URL{Scheme: "file", Path: temp, RawQuery: "_pragma=journal_mode(DELETE)"}
+	db, err := sql.Open("sqlite", targetURL.String())
+	if err != nil {
+		return err
+	}
+	db.SetMaxOpenConns(1)
+	if _, err := db.Exec(`INSERT INTO meta(key, value) VALUES('epoch', ?) ON CONFLICT(key) DO UPDATE SET value=excluded.value`, strconv.FormatUint(epoch, 10)); err != nil {
+		db.Close()
+		return err
+	}
+	if _, err := db.Exec(`INSERT INTO meta(key, value) VALUES('controller_id', '') ON CONFLICT(key) DO UPDATE SET value=''`); err != nil {
+		db.Close()
+		return err
+	}
+	if _, err := db.Exec(`DROP TABLE IF EXISTS raft_log;
+DROP TABLE IF EXISTS raft_stable;
+DELETE FROM meta WHERE key IN ('controller_raft','election_term','elected_controller','fsm_index','state_revision','lease_expires') OR key LIKE 'request:%';
+DELETE FROM snapshots;
+INSERT INTO meta(key,value) VALUES('restore_pending','1') ON CONFLICT(key) DO UPDATE SET value='1';`); err != nil {
+		db.Close()
+		return err
+	}
+	if err := db.Close(); err != nil {
+		return err
+	}
+	if _, err := os.Stat(target); err == nil {
+		return fmt.Errorf("restore target already exists: %s", target)
+	}
+	return os.Rename(temp, target)
 }
 
 func (s *Store) putJSON(table, keyCol, key string, v any, generation int64) error {
@@ -462,10 +584,10 @@ func (s *Store) putJSON(table, keyCol, key string, v any, generation int64) erro
 	}
 	switch table {
 	case "apps":
-		_, err = s.db.Exec(`INSERT INTO apps(name, body, generation) VALUES(?, ?, ?)
+		_, err = s.exec(`INSERT INTO apps(name, body, generation) VALUES(?, ?, ?)
 			ON CONFLICT(name) DO UPDATE SET body=excluded.body, generation=excluded.generation`, key, string(b), generation)
 	case "routes":
-		_, err = s.db.Exec(`INSERT INTO routes(name, body) VALUES(?, ?) ON CONFLICT(name) DO UPDATE SET body=excluded.body`, key, string(b))
+		_, err = s.exec(`INSERT INTO routes(name, body) VALUES(?, ?) ON CONFLICT(name) DO UPDATE SET body=excluded.body`, key, string(b))
 	default:
 		return fmt.Errorf("unknown table %s", table)
 	}
@@ -475,7 +597,7 @@ func (s *Store) putJSON(table, keyCol, key string, v any, generation int64) erro
 func one[T any](s *Store, q string, args ...any) (T, error) {
 	var zero T
 	var body string
-	err := s.db.QueryRow(q, args...).Scan(&body)
+	err := s.queryRow(q, args...).Scan(&body)
 	if err != nil {
 		return zero, err
 	}
@@ -484,7 +606,7 @@ func one[T any](s *Store, q string, args ...any) (T, error) {
 }
 
 func list[T any](s *Store, q string, args ...any) ([]T, error) {
-	rows, err := s.db.Query(q, args...)
+	rows, err := s.query(q, args...)
 	if err != nil {
 		return nil, err
 	}

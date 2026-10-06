@@ -1,6 +1,10 @@
 package k8simport
 
-import "testing"
+import (
+	"fmt"
+	"strings"
+	"testing"
+)
 
 const manifest = `
 apiVersion: apps/v1
@@ -53,5 +57,49 @@ func TestConvertDeployment(t *testing.T) {
 	}
 	if len(got.Skipped) != 1 {
 		t.Fatalf("skipped %v", got.Skipped)
+	}
+}
+
+func TestFromClusterReportsUnsupportedResources(t *testing.T) {
+	res, err := FromClusterOptions(ClusterOptions{Context: "kind-test", Run: func(args []string) ([]byte, error) {
+		joined := strings.Join(args, " ")
+		switch {
+		case strings.Contains(joined, "get deployments,statefulsets,daemonsets,jobs,services,ingresses,configmaps,secrets -A -o json"):
+			return []byte(`{"items":[{"kind":"StatefulSet","metadata":{"name":"db"},"spec":{"template":{"spec":{"containers":[{"image":"postgres:17"}]}}}}]}`), nil
+		case strings.Contains(joined, "get all -A -o json"):
+			return []byte(`{"items":[{"kind":"Pod","metadata":{"name":"db-0"}},{"kind":"ReplicaSet","metadata":{"name":"web-rs"}}]}`), nil
+		case strings.Contains(joined, "get customresourcedefinitions,mutatingwebhookconfigurations,validatingwebhookconfigurations -o json"):
+			return []byte(`{"items":[{"kind":"CustomResourceDefinition","metadata":{"name":"widgets.example.test"}},{"kind":"MutatingWebhookConfiguration","metadata":{"name":"injector"}}]}`), nil
+		default:
+			return nil, fmt.Errorf("unexpected command: %s", joined)
+		}
+	}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(res.Objects) != 1 || res.Objects[0].App == nil || res.Objects[0].App.Name != "db" {
+		t.Fatalf("objects: %+v", res.Objects)
+	}
+	if len(res.Skipped) != 4 || !strings.Contains(res.Skipped[0], "Pod: 1") || !strings.Contains(res.Skipped[1], "ReplicaSet: 1") || !strings.Contains(res.Skipped[2], "widgets.example.test") || !strings.Contains(res.Skipped[3], "injector") {
+		t.Fatalf("skipped: %v", res.Skipped)
+	}
+}
+
+func TestConvertAllServicePorts(t *testing.T) {
+	res, err := Convert([]byte(`kind: Service
+metadata:
+  name: web
+spec:
+  ports:
+    - port: 80
+      targetPort: 8080
+    - port: 443
+      targetPort: 8443
+`))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(res.Objects) != 2 || res.Objects[0].Route.Port != 80 || res.Objects[1].Route.Port != 443 || res.Objects[0].Route.Name == res.Objects[1].Route.Name {
+		t.Fatalf("routes: %+v", res.Objects)
 	}
 }

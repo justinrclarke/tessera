@@ -2,7 +2,7 @@
 
 Tessera is a single Go binary that runs containers across machines on a LAN. You say what should be running. The controller places it, restarts it, and moves it. You do not assemble Deployments, Services, and probes by hand.
 
-Healing is deterministic. A model is optional, and only for explanation. If the controller dies, a node with the newest signed snapshot can take over. Wipe, reimage, and delete are never done automatically.
+Healing is deterministic. A model is optional, and only for explanation. If a standalone controller dies, a node with the newest signed snapshot can take over. With three controller replicas, a majority elects the replacement and agents reconnect without restarting running work. Wipe, reimage, and delete are never done automatically.
 
 What is coming next is in [ROADMAP.md](ROADMAP.md).
 
@@ -28,6 +28,8 @@ The controller advertises `_tessera._tcp`. Copy the token once. After that, disc
 
 State lives in `$TESSERA_DATA` or `~/.tessera`. Override the client with `TESSERA_URL` and `TESSERA_TOKEN`.
 
+Run `tessera` or `tessera session` to open a session against your configured controller. Enter `get apps`, `apply -f app.yaml`, `import -f deploy.yaml`, or another CLI command to run it. Any other line is a question, answered through the same deterministic diagnosis as `ask`. Commands accept quoted paths, such as `apply -f "my app.yaml"`, and an optional `tessera` prefix. Errors leave the session open. Type `exit` or `quit`, or close standard input, to leave the cluster running. Start long-running processes such as `up`, `agent`, and `mcp` in a separate terminal; use file paths for manifests inside a session.
+
 ## What you write
 
 ```yaml
@@ -48,9 +50,32 @@ Kinds: App, Job, Model, Route, Config, Secret, Policy. Separate documents with `
 
 A Job runs to completion. Set `gang: true` when every replica must land together or not at all. A Model is an App that prefers GPU nodes. A Route is a stable port on the controller. When a move starts a replacement and that replacement is running, the route cuts over. The client keeps the same address.
 
+Start an agent with `--labels fabric=ethernet-a,storage=shared` to describe its host. An App or Job can require `node_labels: {storage: shared}`. For a gang Job, `gang_fabric: fabric` keeps all workers on nodes with the same `fabric` value. Labels describe a real link or shared mount; Tessera does not create either one.
+
 `cpu` accepts Kubernetes-style quantities (`100m`, `1`). `memory` accepts `128Mi`, `1Gi`, or a byte count.
 
+For an NVIDIA model server, set `kind: Model`, `gpus: 1`, and optionally `gpu_model: NVIDIA H100` and `gpu_memory: 20Gi`. The agent reads model and free memory through `nvidia-smi`; Tessera reserves a GPU UUID for each replica and asks Docker to expose that device. The host needs an NVIDIA driver and the NVIDIA Container Toolkit. GPU memory is checked at placement time and is not a container memory limit. The `ctr` runtime currently rejects GPU workloads. Attach a Route to the Model name as you would for an App.
+
 A release change (image, command, env, configs, secrets) bumps generation. Replica-only changes do not. If the new generation fails and an older one was healthy, Tessera rolls back.
+
+An App can include a `build` stanza instead of an `image`. `tessera apply -f app.yaml` builds it with the local Docker CLI before applying the resulting image. The build file names a base image, optional `apk` or `apt` packages, a process command, and a repository. Tessera copies the selected context into `/app`. With `push: true`, Docker uses credentials already configured on the operator's machine and Tessera applies the registry digest. Without push, it applies a local image-ID tag, which is useful only when the controller and nodes can obtain that image through their local runtime or Tessera's image cache.
+
+```yaml
+kind: App
+name: web
+build:
+  base: python:3.13-alpine
+  repository: registry.example.com/team/web
+  context: ./web
+  package_manager: apk
+  packages: [curl]
+  command: [python, app.py]
+  push: true
+ports:
+  - container: 8080
+```
+
+Set `push: false` to keep the image local. The pushed App image is pinned to the digest reported by the registry. Changes to the base tag or package repository between builds can produce different image IDs; pin the base image and package versions when repeatability matters.
 
 ## What it does on its own
 
@@ -70,18 +95,73 @@ If the leader's lease expires, a node holding the snapshot can promote itself. A
 
 ## Kubernetes
 
-`tessera import -f deploy.yaml` converts Deployment, StatefulSet, DaemonSet, Job, Service, Ingress, ConfigMap, and Secret. Other kinds are printed as skipped. `--from-cluster` shells out to `kubectl`. This is a conversion, not a Kubernetes API.
+`tessera import -f deploy.yaml` converts Deployment, StatefulSet, DaemonSet, Job, Service, Ingress, ConfigMap, and Secret. Other kinds are printed as skipped. `--from-cluster` shells out to `kubectl`, includes StatefulSets and DaemonSets, and reports unsupported kinds found by `kubectl get all`, custom resource definitions, and webhook configurations. It reports an inspection warning if access to either inventory is denied. Custom resource instances are not converted. This is a conversion, not a Kubernetes API.
 
 ```
 tessera import -f deploy.yaml --dry-run
-tessera import --from-cluster
+tessera import --from-cluster --kubeconfig /path/to/kubeconfig --namespace demo --dry-run
+tessera ask --kubeconfig /path/to/kubeconfig --namespace demo "why is web down?"
+tessera mcp --kubeconfig /path/to/kubeconfig --namespace demo
 ```
+
+`ask` and `mcp` use the same read-only tool names against the selected Kubernetes cluster. They inspect Deployments, StatefulSets, DaemonSets, Jobs, Pods, nodes, and warning events. Use `--context NAME` to select a context, or `--kubernetes` to use the current `kubectl` context. These flags select the Kubernetes bridge instead of the Tessera controller. Workloads in different namespaces need `namespace/name` for `get_app` and `logs`. The bridge does not mutate Kubernetes objects or record Tessera actions. Your kubeconfig needs read access to the inspected resources.
+
+`sh lab/kubernetes.sh` runs the 0.3.0 handoff drill with an isolated kind cluster and kubeconfig. It diagnoses a failed image pull, converts a Deployment and Service, applies them to the local Tessera lab, checks the resulting Route, and removes its test clusters. It requires `kind`, `kubectl`, Docker Compose, Go, and `curl`, and refuses to replace an already running Tessera lab.
 
 ## Boot and backup
 
-`tessera install` writes a launchd agent or a systemd user unit. It does not load it. `tessera backup -o tessera-backup.db` copies the SQLite store.
+`tessera install` copies the running binary to `~/.local/bin/tessera`, writes a launchd agent on macOS or a systemd user unit on Linux, and starts it. The service runs `tessera agent` against an existing controller. Supply `--url` and `--token`, or use the saved controller configuration. With only a token, the agent discovers the controller over mDNS and saves its address for subsequent CLI commands. The token stays in private files in the data directory. `--runtime` and `--labels` configure the installed node, `--bin-dir` changes the binary destination, and `--data` changes the cluster data directory. Use the same `TESSERA_DATA` directory for subsequent CLI commands. Add the binary directory to your shell's `PATH` if needed.
+
+```sh
+./tessera install --url http://controller:7468 --token "$TESSERA_TOKEN"
+~/.local/bin/tessera
+```
+
+For the first machine, run `tessera controller` in one terminal, then `tessera install` in another to start its agent from the saved configuration. `tessera up` remains the combined controller and agent path for foreground use. Keep one agent process per node data directory. Re-running install replaces the binary atomically and restarts the user service. `--no-start` writes the files without changing the running service; omit it on a subsequent install to activate the service. Service startup errors are reported even when the files were installed successfully. macOS writes agent output to `DATA_DIRECTORY/agent.log`; Linux uses the user journal. These are user services and follow the platform's user-session lifecycle.
+
+`tessera backup -o tessera-backup.db` copies the local SQLite store through a read-only connection while the controller may be running. For an offline replacement controller, run `tessera restore -f tessera-backup.db --data NEW_DIRECTORY` before starting it. Restore checks the backup, refuses an existing database, preserves the cluster token and committed data, assigns a fresh controller identity, and advances the leader epoch. A replica backup also clears old consensus metadata and logs. `--epoch N` sets a higher minimum epoch when agents have seen a later leader. Stop or fence every previous controller before starting the replacement; image cache files are separate from the database backup.
+
+## Three controller replicas
+
+Start a new cluster on three machines with empty controller data directories, stable controller IDs, and the same `TESSERA_TOKEN`. Give every process the same peer list. Each peer entry is `ID=RAFT_ADDRESS@HTTP_URL`; the addresses must be reachable by the other controllers and agents. Replication uses mutual TLS authenticated by the shared token. The HTTP API uses the bearer token; use the trusted LAN or an HTTPS reverse proxy for it.
+
+Set this peer list on each machine, replacing the hostnames with your own:
+
+```sh
+PEERS='a=controller-a:7469@http://controller-a:7468,b=controller-b:7469@http://controller-b:7468,c=controller-c:7469@http://controller-c:7468'
+```
+
+On controller A:
+
+```sh
+tessera controller --id a --listen :7468 --raft-listen :7469 --data ~/.tessera-a --peers "$PEERS" --bootstrap
+```
+
+On controller B and controller C, respectively:
+
+```sh
+tessera controller --id b --listen :7468 --raft-listen :7469 --data ~/.tessera-b --peers "$PEERS"
+tessera controller --id c --listen :7468 --raft-listen :7469 --data ~/.tessera-c --peers "$PEERS"
+```
+
+Use `--bootstrap` on A for the first start. Restart each controller with its original ID, directory, token, and peer list. A stored replica database requires the replica configuration when reopened. Membership changes and converting an existing standalone database into replicas are not supported.
+
+Agents and CLI clients can start with one listed HTTP URL and learn the others, or take all three URLs separated by commas to tolerate an unavailable initial controller:
+
+```sh
+tessera install --url http://controller-a:7468,http://controller-b:7468,http://controller-c:7468 --token "$TESSERA_TOKEN"
+TESSERA_URL=http://controller-a:7468,http://controller-b:7468,http://controller-c:7468 tessera get apps
+```
+
+Two controllers are required to commit changes. If a majority is unreachable, existing containers continue running and agents keep reconnecting; they do not create another standalone leader. Controller state and release history are replicated. Image cache files stay on each controller, so images needed after failover must also be available from their registry or the node runtime. Route ports remain local to each controller; this does not provide a floating network address for Routes. The acceptance drill and TCP/TLS restart tests run locally without Docker; acceptance on three physical machines remains open.
 
 `tessera up` restarts itself through a watchdog unless you pass `--watched` or set `TESSERA_WATCHED=1`. A clean exit is not restarted. A child that dies within 500ms is not restarted either.
+
+## Cloud inventory
+
+`tessera cloud inventory --provider aws --region us-east-1`, `--provider gcp --project PROJECT`, or `--provider azure --subscription SUBSCRIPTION` reads VM lists through the installed AWS, gcloud, or Azure CLI and its existing login. This is read-only discovery. It does not create VMs or make them Tessera Nodes; an instance becomes a Node when its Tessera agent joins with the cluster token. Cloud inventory adapters are covered by scripted local tests, while real account validation remains open.
+
+`tessera infra plan -f desired.yaml [--state current.json]` previews a file with `networks`, `machines`, and `apps`. The optional state file is a local JSON fixture with the same resource names and `owned` flags; without it, the planner treats every desired resource as missing. This preview makes no cloud calls. It orders network, machine, and App changes, produces a stable generation hash, and marks changes to networks or machines and removal of owned resources as `confirm`. Adopted resources absent from the desired file are left alone. Cloud backed state discovery and `infra apply` are still planned.
 
 ## Check
 

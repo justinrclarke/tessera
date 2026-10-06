@@ -93,9 +93,14 @@ func decodeApp(raw map[string]any, kind string) (App, error) {
 		}
 	}
 	var resRaw any
+	var gpuMemoryRaw any
 	if v, ok := raw["resources"]; ok {
 		resRaw = v
 		delete(raw, "resources")
+	}
+	if v, ok := raw["gpu_memory"]; ok {
+		gpuMemoryRaw = v
+		delete(raw, "gpu_memory")
 	}
 	var app App
 	if err := remarshal(raw, &app); err != nil {
@@ -121,6 +126,22 @@ func decodeApp(raw map[string]any, kind string) (App, error) {
 			return App{}, err
 		}
 		app.Resources = Resources{CPU: cpu, Memory: mem}
+	}
+	if gpuMemoryRaw != nil {
+		gpuMemory, err := ParseMemory(gpuMemoryRaw)
+		if err != nil {
+			return App{}, err
+		}
+		app.GPUMemory = gpuMemory
+	}
+	if app.GPUs < 0 || app.GPUMemory < 0 {
+		return App{}, fmt.Errorf("app %s: GPU requests cannot be negative", app.Name)
+	}
+	if app.GPUs == 0 && (app.GPUModel != "" || app.GPUMemory > 0) {
+		return App{}, fmt.Errorf("app %s: gpu_model and gpu_memory require gpus", app.Name)
+	}
+	if app.GangFabric != "" && (!app.Gang || app.Kind != KindJob) {
+		return App{}, fmt.Errorf("app %s: gang_fabric requires a gang Job", app.Name)
 	}
 	if app.SensitiveTo == "" && app.GPUs > 0 {
 		app.SensitiveTo = "gpu"

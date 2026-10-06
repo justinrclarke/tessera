@@ -9,13 +9,14 @@ import (
 )
 
 type Spec struct {
-	Name      string
-	Image     string
-	Command   []string
-	Env       map[string]string
-	Ports     []api.Port
-	Resources api.Resources
-	GPUs      int
+	Name       string
+	Image      string
+	Command    []string
+	Env        map[string]string
+	Ports      []api.Port
+	Resources  api.Resources
+	GPUs       int
+	GPUDevices []string
 }
 
 type Container struct {

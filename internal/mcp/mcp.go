@@ -8,14 +8,20 @@ import (
 
 	"tessera/internal/api"
 	"tessera/internal/client"
+	"tessera/internal/k8sbridge"
 )
 
 type Server struct {
 	Client *client.Client
+	Bridge *k8sbridge.Bridge
 }
 
 func (s *Server) Run(ctx context.Context) error {
 	srv := mcpsdk.NewServer(&mcpsdk.Implementation{Name: "tessera", Version: api.Version}, nil)
+	if s.Bridge != nil {
+		s.addKubernetes(srv)
+		return srv.Run(ctx, &mcpsdk.StdioTransport{})
+	}
 	add(srv, "list_apps", "List Tessera apps", func(ctx context.Context, _ empty) (string, error) {
 		apps, err := s.Client.ListApps(ctx)
 		return asJSON(apps, err)
@@ -58,6 +64,72 @@ func (s *Server) Run(ctx context.Context) error {
 		return asJSON(map[string]any{"nodes": nodes, "assignments": len(asgs)}, nil)
 	})
 	return srv.Run(ctx, &mcpsdk.StdioTransport{})
+}
+
+func (s *Server) addKubernetes(srv *mcpsdk.Server) {
+	add(srv, "list_apps", "List Kubernetes workloads without changing them", func(ctx context.Context, _ empty) (string, error) {
+		view, err := s.Bridge.Inspect(ctx)
+		if err != nil {
+			return "", err
+		}
+		return asJSON(view.Workloads, nil)
+	})
+	add(srv, "get_app", "Get a Kubernetes workload by namespace/name", func(ctx context.Context, in nameIn) (string, error) {
+		view, err := s.Bridge.Inspect(ctx)
+		if err != nil {
+			return "", err
+		}
+		app, err := view.Workload(in.Name)
+		return asJSON(app, err)
+	})
+	add(srv, "list_nodes", "List Kubernetes nodes and readiness", func(ctx context.Context, _ empty) (string, error) {
+		view, err := s.Bridge.Inspect(ctx)
+		if err != nil {
+			return "", err
+		}
+		return asJSON(view.Nodes, nil)
+	})
+	add(srv, "get_node", "Get a Kubernetes node by name", func(ctx context.Context, in nameIn) (string, error) {
+		view, err := s.Bridge.Inspect(ctx)
+		if err != nil {
+			return "", err
+		}
+		node, err := view.Node(in.Name)
+		return asJSON(node, err)
+	})
+	add(srv, "logs", "Recent logs for a Kubernetes workload", func(ctx context.Context, in nameIn) (string, error) {
+		return s.Bridge.Logs(ctx, in.Name)
+	})
+	add(srv, "diagnose", "Inspect Kubernetes workload and node availability without changes", func(ctx context.Context, _ empty) (string, error) {
+		view, err := s.Bridge.Inspect(ctx)
+		if err != nil {
+			return "", err
+		}
+		return asJSON(view.Findings(), nil)
+	})
+	add(srv, "list_actions", "Kubernetes bridge performs no Tessera actions", func(ctx context.Context, _ empty) (string, error) {
+		return asJSON([]api.Action{}, nil)
+	})
+	add(srv, "explain", "Explain Kubernetes availability from live status", func(ctx context.Context, in askIn) (string, error) {
+		view, err := s.Bridge.Inspect(ctx)
+		if err != nil {
+			return "", err
+		}
+		return view.Explain(in.Question), nil
+	})
+	add(srv, "metrics", "Kubernetes node readiness and workload counts", func(ctx context.Context, _ empty) (string, error) {
+		view, err := s.Bridge.Inspect(ctx)
+		if err != nil {
+			return "", err
+		}
+		ready := 0
+		for _, node := range view.Nodes {
+			if node.Ready {
+				ready++
+			}
+		}
+		return asJSON(map[string]int{"nodes": len(view.Nodes), "nodes_ready": ready, "workloads": len(view.Workloads), "findings": len(view.Findings())}, nil)
+	})
 }
 
 type empty struct{}

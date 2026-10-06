@@ -7,8 +7,9 @@ import (
 )
 
 type File struct {
-	URL   string `json:"url"`
-	Token string `json:"token"`
+	Controllers []string `json:"controllers,omitempty"`
+	URL         string   `json:"url"`
+	Token       string   `json:"token"`
 }
 
 func Dir() string {

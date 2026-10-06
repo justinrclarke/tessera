@@ -1,5 +1,44 @@
 # Changelog
 
+## CLI completion (unreleased)
+
+- `tessera install` now installs the binary and starts a user service running `tessera agent` on macOS or Linux. It accepts controller, runtime, label, and directory settings, keeps tokens in private files, replaces the binary atomically on upgrade, and offers `--no-start` to stage files.
+- `tessera` and `tessera session` open a session for CLI commands and questions. Quoted paths work, command errors leave the session open, and exiting leaves the cluster running. A controller-backed CLI test covers apply, get, and ask; service-manager commands use scripted tests.
+- Agents use a saved controller address even when the token came from the token file, and persist an address discovered for an installed node. CLI environment overrides also work before a client file exists.
+
+## 0.9.0 (early work)
+
+- Added a pure infrastructure planner for networks, machines, and Apps. It shows stable generations, orders create actions by dependency, and proposes destructive changes for confirmation. The CLI currently compares with a local state file; no cloud apply path exists yet.
+
+## 0.8.0 (early work)
+
+- Added read-only VM inventory through the locally installed AWS, gcloud, and Azure CLIs, with scripted tests for all three providers. Provisioning and live account validation remain open.
+
+## 0.7.0 (early work)
+
+- An App build stanza now creates an OCI image during `tessera apply`. It can install `apk` or `apt` packages, copy a source context, and set the process. Local images use an image-ID tag; published images use a registry digest. A disposable local registry push/pull drill passed on OrbStack. Package artifacts and cross-cluster acceptance remain open.
+
+## 0.6.0 (early work)
+
+- Agents accept host labels; Apps and Jobs can select them. Gang Jobs can require all workers to share one fabric label value. Checkpoint and coordinated gang moves remain open.
+
+## 0.5.0 (early work)
+
+- Agents now report NVIDIA GPU UUIDs, model names, and free memory from `nvidia-smi`. Apps and Models can request a GPU model and minimum free memory; placement reserves distinct devices and Docker passes their UUIDs to the NVIDIA Container Toolkit. The containerd runtime reports GPU workloads as unsupported. NVIDIA host acceptance remains open.
+
+## 0.4.0 (local implementation verified)
+
+- Added three-controller consensus with Hashicorp Raft, an atomic replicated command log through the existing SQLite connection, and mutual TLS for replication. Followers redirect clients, and minority partitions cannot commit resource changes.
+- Agents and CLI clients learn all three addresses and retry through elections. Successful mutation receipts survive leader changes, running assignment IDs stay fixed, and agents persist fencing epochs and decline standalone promotion in replica clusters.
+- The acceptance drill covers a lost update response, leader failover, workload continuity, restarted replica catch-up, a partitioned old leader, and offline recovery. Real local TCP/TLS tests cover full restart from a snapshot and subsequent log entries. Multi-machine acceptance remains open; membership is fixed and new clusters require empty stores.
+- Offline `tessera restore` preserves committed resources and release history from replica backups while clearing old consensus state and advancing the epoch. `tessera backup` reads a live database without opening another writer. Image cache files remain separate.
+
+## 0.3.0 (in progress)
+
+- Added read-only Kubernetes inspection to `tessera ask` and the existing MCP tools through `kubectl`, with kubeconfig, context, and namespace selection.
+- Cluster import now includes StatefulSets and DaemonSets and reports unsupported built-in kinds, custom resource definitions, and webhook configurations. Multiple Service ports convert to distinct Routes.
+- Added a disposable kind-to-Tessera drill. It diagnosed an image pull failure, imported a Deployment and Service, and verified the App through a Tessera Route on macOS with OrbStack.
+
 ## 0.2.0 (local implementation verified)
 
 - A local Docker lab starts two isolated nodes and a sample Route, offers k6 load profiles and failure scenarios, and provides optional registry, PostgreSQL, Redis, and S3-compatible services. The sample workload reaches those services by name from either node. The clean-state drill verifies image transfer through the leader cache on failover and passed on macOS with OrbStack. Docker Desktop and native Linux host compatibility remains unverified.

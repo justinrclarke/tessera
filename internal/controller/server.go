@@ -21,11 +21,12 @@ import (
 )
 
 type Config struct {
-	DataDir string
-	Token   string
-	ID      string
-	Epoch   uint64
-	URL     string
+	DataDir  string
+	Token    string
+	ID       string
+	Epoch    uint64
+	URL      string
+	Replicas *ReplicaConfig
 }
 
 type Server struct {
@@ -37,20 +38,56 @@ type Server struct {
 	Now      func() time.Time
 	Discover func(ctx context.Context) ([]survive.Claim, error)
 
-	mu       sync.Mutex
-	epoch    uint64
-	leading  bool
-	expires  time.Time
-	rev      int64
-	waiters  []chan struct{}
-	lastMove map[string]time.Time
-	ca       pki.Material
-	proxy    *proxy.Proxy
-	http     *http.Server
-	cancel   context.CancelFunc
+	mu          sync.Mutex
+	epoch       uint64
+	leading     bool
+	expires     time.Time
+	rev         int64
+	waiters     []chan struct{}
+	lastMove    map[string]time.Time
+	ca          pki.Material
+	proxy       *proxy.Proxy
+	http        *http.Server
+	cancel      context.CancelFunc
+	replica     *replication
+	controllers []string
 }
 
 func New(st *store.Store, cfg Config) (*Server, error) {
+	if cfg.Replicas != nil {
+		if err := validateReplicas(cfg); err != nil {
+			return nil, err
+		}
+		membership, err := st.Meta("controller_raft")
+		if err != nil {
+			return nil, err
+		}
+		if membership == "" {
+			populated, err := st.HasResources()
+			if err != nil {
+				return nil, err
+			}
+			if populated {
+				return nil, errors.New("new replica clusters require empty stores; use restore for offline recovery of existing state")
+			}
+		} else {
+			id, err := st.Meta("controller_id")
+			if err != nil {
+				return nil, err
+			}
+			token, err := st.Meta("token")
+			if err != nil {
+				return nil, err
+			}
+			if id != cfg.ID || token != cfg.Token {
+				return nil, errors.New("replica identity and token must match the stored configuration")
+			}
+		}
+	} else if value, err := st.Meta("controller_raft"); err != nil {
+		return nil, err
+	} else if value != "" {
+		return nil, errors.New("replicated controller requires its replica configuration; use restore for offline recovery")
+	}
 	token := cfg.Token
 	if token == "" {
 		token, _ = st.Meta("token")
@@ -110,6 +147,33 @@ func New(st *store.Store, cfg Config) (*Server, error) {
 		proxy:    proxy.New(),
 	}
 	s.loadMoves()
+	if pending, err := st.Meta("restore_pending"); err != nil {
+		return nil, err
+	} else if pending == "1" {
+		assignments, err := st.ListAssignments()
+		if err != nil {
+			return nil, err
+		}
+		for _, assignment := range assignments {
+			if api.Active(assignment.Status) {
+				assignment.Epoch = epoch
+				if err := st.PutAssignment(assignment); err != nil {
+					return nil, err
+				}
+			}
+		}
+		if err := s.writeSnapshotLocked(s.now()); err != nil {
+			return nil, err
+		}
+		if err := st.SetMeta("restore_pending", ""); err != nil {
+			return nil, err
+		}
+	}
+	if cfg.Replicas != nil {
+		if err := s.startReplication(*cfg.Replicas); err != nil {
+			return nil, err
+		}
+	}
 	return s, nil
 }
 
@@ -120,12 +184,18 @@ func (s *Server) Epoch() uint64 {
 }
 
 func (s *Server) Leading() bool {
+	if s.replica != nil {
+		return s.replica.ready()
+	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	return s.leading
 }
 
 func (s *Server) Observe(c survive.Claim) bool {
+	if s.replica != nil {
+		return false
+	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	best := survive.Preferred([]survive.Claim{{Epoch: s.epoch, ID: s.ID}, c})
@@ -162,16 +232,18 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("GET /v1/snapshot", s.handleSnapshot)
 	mux.HandleFunc("POST /v1/election", s.handleElection)
 	mux.HandleFunc("POST /v1/act", s.handleAct)
-	return s.auth(mux)
+	return s.auth(s.replicatedHandler(mux))
 }
 
 func (s *Server) Serve(ctx context.Context, ln net.Listener) error {
 	if s.Now == nil {
 		s.Now = time.Now
 	}
-	s.URL = clientURL(ln.Addr())
+	if s.URL == "" {
+		s.URL = clientURL(ln.Addr())
+	}
 	if s.DataDir != "" {
-		_ = config.Save(s.DataDir, config.File{URL: s.URL, Token: s.Token})
+		_ = config.Save(s.DataDir, config.File{URL: s.URL, Token: s.Token, Controllers: s.controllerURLs()})
 	}
 	ctx, cancel := context.WithCancel(ctx)
 	s.cancel = cancel
@@ -179,7 +251,9 @@ func (s *Server) Serve(ctx context.Context, ln net.Listener) error {
 	s.expires = s.Now().Add(s.mustPolicy().Lease())
 	s.mu.Unlock()
 	go s.loop(ctx)
-	go s.watchPeers(ctx)
+	if s.replica == nil {
+		go s.watchPeers(ctx)
+	}
 	s.http = &http.Server{Handler: s.Handler()}
 	err := s.http.Serve(ln)
 	if errors.Is(err, http.ErrServerClosed) {
@@ -191,6 +265,12 @@ func (s *Server) Serve(ctx context.Context, ln net.Listener) error {
 func (s *Server) Close() error {
 	if s.cancel != nil {
 		s.cancel()
+	}
+	if s.replica != nil {
+		_ = s.replica.raft.Shutdown().Error()
+		if closer, ok := s.replica.transport.(interface{ Close() error }); ok {
+			_ = closer.Close()
+		}
 	}
 	if s.proxy != nil {
 		s.proxy.Close()

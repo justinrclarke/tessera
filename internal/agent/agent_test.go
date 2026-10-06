@@ -2,15 +2,107 @@ package agent
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
+	"fmt"
+	"net/http"
+	"net/http/httptest"
 	"os"
 	"path/filepath"
 	"testing"
 	"time"
 
 	"tessera/internal/api"
+	"tessera/internal/client"
 	"tessera/internal/runtime"
+	"tessera/internal/survive"
 )
+
+func TestNewEpochAcceptsEarlierSnapshotIndexAndUsesSignedBody(t *testing.T) {
+	ctx := context.Background()
+	actual := api.Snapshot{Index: 2, Epoch: 5, LeaderID: "restored", Apps: []api.App{{Name: "web", Image: "restored"}}}
+	body, err := json.Marshal(actual)
+	if err != nil {
+		t.Fatal(err)
+	}
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		_ = json.NewEncoder(w).Encode(client.SignedSnapshot{Snapshot: api.Snapshot{Index: 100, Epoch: 99}, Body: string(body), Sig: survive.Sign("token", body)})
+	}))
+	defer srv.Close()
+	ag := &Agent{ID: "n1", DataDir: t.TempDir(), Client: client.New(srv.URL, "token"), Token: "token", maxEpoch: 5, snapEpoch: 4, snapIndex: 100}
+	if err := ag.fetchSnapshot(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if ag.snapIndex != 2 || ag.snapEpoch != 5 || ag.maxEpoch != 5 {
+		t.Fatalf("accepted unsigned fields or rejected restored snapshot: %+v", ag)
+	}
+	cache, err := ag.readCache()
+	if err != nil || cache.SnapBody != string(body) || !survive.Verify("token", []byte(cache.SnapBody), cache.Sig) {
+		t.Fatal("changed signed raw snapshot bytes")
+	}
+	cache.Snapshot.Epoch = 99
+	if err := ag.writeCache(cache); err != nil {
+		t.Fatal(err)
+	}
+	loaded, err := ag.loadSnapshot()
+	if err != nil || loaded.Epoch != 5 || loaded.Index != 2 {
+		t.Fatalf("loaded unsigned cache fields: %+v %v", loaded, err)
+	}
+	ag.maxEpoch = 6
+	if err := ag.fetchSnapshot(ctx); err == nil {
+		t.Fatal("accepted snapshot from an earlier epoch")
+	}
+}
+
+func TestStalePageAndHeartbeatCannotStopRunningWork(t *testing.T) {
+	for _, staleHeartbeat := range []bool{false, true} {
+		t.Run(fmt.Sprint(staleHeartbeat), func(t *testing.T) {
+			now := time.Now()
+			srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				var response any
+				switch r.URL.Path {
+				case "/v1/nodes/register":
+					response = client.RegisterResponse{Epoch: 4}
+				case "/v1/nodes/n1/heartbeat":
+					hb := client.HeartbeatResponse{Epoch: 4, Leading: true, Expires: now.Add(time.Minute)}
+					if staleHeartbeat {
+						hb.Epoch = 3
+						hb.Command = &client.NodeCommand{ID: "old-wipe", Kind: "wipe"}
+					}
+					response = hb
+				case "/v1/nodes/n1/assignments":
+					response = client.Page{Epoch: 3}
+				default:
+					response = struct{}{}
+				}
+				_ = json.NewEncoder(w).Encode(response)
+			}))
+			defer srv.Close()
+			fake := runtime.NewFake()
+			ag := &Agent{ID: "n1", DataDir: t.TempDir(), Runtime: fake, Now: func() time.Time { return now }, GPUProbe: func(context.Context) ([]api.GPU, error) { return nil, nil }}
+			epoch := uint64(3)
+			if staleHeartbeat {
+				epoch = 4
+			}
+			ag.SetEpoch(epoch)
+			if err := ag.ConvergeForTest(context.Background(), []api.Assignment{{ID: "keep", App: "web", Image: "nginx", Epoch: epoch, Status: api.StatusRunning}}, true); err != nil {
+				t.Fatal(err)
+			}
+			ag.Client = client.New(srv.URL, "token")
+			if err := ag.Tick(context.Background()); err == nil {
+				t.Fatal("accepted stale controller response")
+			}
+			items, err := fake.List(context.Background())
+			if err != nil || len(items) != 1 || items[0].ID != "tessera_keep" || !items[0].Running {
+				t.Fatalf("stale response stopped running work: %+v %v", items, err)
+			}
+			cache, err := ag.readCache()
+			if err != nil || cache.Epoch != 4 {
+				t.Fatalf("fencing epoch not persisted: %+v %v", cache, err)
+			}
+		})
+	}
+}
 
 type failedStop struct{ runtime.Runtime }
 
@@ -46,6 +138,29 @@ func TestPerfRecordedOnceThenHourly(t *testing.T) {
 	_ = ag2.perf()
 	if !ag2.perfAt.Equal(cur) {
 		t.Fatal("did not refresh")
+	}
+}
+
+func TestGPUInventoryRefreshesAndReports(t *testing.T) {
+	cur := time.Now()
+	calls := 0
+	ag := &Agent{DataDir: t.TempDir(), Now: func() time.Time { return cur }, GPUProbe: func(context.Context) ([]api.GPU, error) {
+		calls++
+		return []api.GPU{{UUID: "gpu-one", Model: "NVIDIA H100", MemoryFree: 20 << 30}}, nil
+	}}
+	first := ag.reportHost()
+	if first.GPUs != 1 || len(first.GPUInventory) != 1 || calls != 1 {
+		t.Fatalf("first report %+v, calls %d", first, calls)
+	}
+	cur = cur.Add(10 * time.Second)
+	_ = ag.reportHost()
+	if calls != 1 {
+		t.Fatalf("probed %d times inside refresh window", calls)
+	}
+	cur = cur.Add(30 * time.Second)
+	_ = ag.reportHost()
+	if calls != 2 {
+		t.Fatalf("did not refresh: %d calls", calls)
 	}
 }
 
