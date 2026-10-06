@@ -3,17 +3,20 @@ package agent
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"net"
 	"os"
 	"path/filepath"
 	"strings"
+	"syscall"
 	"time"
 
 	"tessera/internal/api"
 	"tessera/internal/bench"
 	"tessera/internal/client"
 	"tessera/internal/controller"
+	"tessera/internal/discover"
 	"tessera/internal/host"
 	"tessera/internal/runtime"
 	"tessera/internal/store"
@@ -33,6 +36,7 @@ type Agent struct {
 	LostAt      time.Time
 	Others      int
 	PeerIDs     []string
+	Reexec      func() error
 
 	maxEpoch  uint64
 	snapIndex uint64
@@ -50,7 +54,11 @@ type diskCache struct {
 	SnapBody    string           `json:"snap_body"`
 	Sig         string           `json:"sig"`
 	Epoch       uint64           `json:"epoch"`
+	Perf        api.Perf         `json:"perf,omitempty"`
+	PerfAt      time.Time        `json:"perf_at,omitempty"`
 }
+
+var ErrHalted = errors.New("halted")
 
 func (a *Agent) Run(ctx context.Context) error {
 	a.init()
@@ -60,6 +68,9 @@ func (a *Agent) Run(ctx context.Context) error {
 			return err
 		}
 		if err := a.Tick(ctx); err != nil {
+			if errors.Is(err, ErrHalted) {
+				return err
+			}
 			a.noteLoss()
 			_, _ = a.maybePromote(ctx)
 			if !sleep(ctx, time.Second) {
@@ -68,7 +79,7 @@ func (a *Agent) Run(ctx context.Context) error {
 			continue
 		}
 		a.LostAt = time.Time{}
-		page, err := a.Client.WaitAssignments(ctx, a.ID, a.rev, 5*time.Second)
+		page, err := a.Client.WaitAssignments(ctx, a.ID, a.rev, time.Second)
 		if err != nil {
 			a.noteLoss()
 			_, _ = a.maybePromote(ctx)
@@ -95,6 +106,9 @@ func (a *Agent) Tick(ctx context.Context) error {
 	}
 	if hb.Epoch > a.maxEpoch {
 		a.maxEpoch = hb.Epoch
+	}
+	if hb.Command != nil {
+		return a.execCommand(ctx, hb.Command)
 	}
 	if !hb.Leading {
 		return fmt.Errorf("leader not leading")
@@ -256,7 +270,12 @@ func (a *Agent) converge(ctx context.Context, desired []api.Assignment, live boo
 				a.report(ctx, d, api.StatusFailed, reason, c)
 				continue
 			}
+			if err := a.Runtime.Stop(ctx, c.ID); err != nil {
+				a.report(ctx, d, api.StatusFailed, err.Error(), c)
+				continue
+			}
 		}
+		a.ensureImage(ctx, d.Image)
 		started, err := a.Runtime.Start(ctx, runtime.Spec{
 			Name: name, Image: d.Image, Command: d.Command, Env: d.Env, Ports: d.Ports, Resources: d.Resources, GPUs: d.GPUs,
 		})
@@ -272,6 +291,7 @@ func (a *Agent) converge(ctx context.Context, desired []api.Assignment, live boo
 			started.Name = name
 		}
 		a.report(ctx, d, api.StatusRunning, "", started)
+		a.publishImage(ctx, d.Image)
 	}
 	if live {
 		for name, c := range byName {
@@ -451,9 +471,22 @@ func (a *Agent) diskTotal() int64 {
 }
 
 func (a *Agent) perf() api.Perf {
-	if a.perfAt.IsZero() || a.now().Sub(a.perfAt) > 5*time.Minute {
+	if a.perfAt.IsZero() {
+		if c, err := a.readCache(); err == nil && !c.PerfAt.IsZero() {
+			a.perfScore = c.Perf
+			a.perfAt = c.PerfAt
+		}
+	}
+	if a.perfAt.IsZero() || a.now().Sub(a.perfAt) >= time.Hour {
 		a.perfScore = bench.Quick(a.DataDir)
 		a.perfAt = a.now()
+		c, _ := a.readCache()
+		c.Perf = a.perfScore
+		c.PerfAt = a.perfAt
+		if c.NodeID == "" {
+			c.NodeID = a.ID
+		}
+		_ = a.writeCache(c)
 	}
 	return a.perfScore
 }
@@ -462,7 +495,130 @@ func (a *Agent) addr() string {
 	if a.Addr != "" {
 		return a.Addr
 	}
+	ips := discover.LocalIPs()
+	if len(ips) > 0 {
+		return ips[0].String()
+	}
 	return "127.0.0.1"
+}
+
+func (a *Agent) ensureImage(ctx context.Context, ref string) {
+	if a.Runtime == nil || ref == "" {
+		return
+	}
+	if has, err := a.Runtime.HasImage(ctx, ref); err == nil && has {
+		return
+	}
+	if a.Client == nil {
+		return
+	}
+	rc, err := a.Client.GetImage(ctx, ref)
+	if err != nil {
+		return
+	}
+	defer rc.Close()
+	_ = a.Runtime.ImportImage(ctx, ref, rc)
+}
+
+func (a *Agent) publishImage(ctx context.Context, ref string) {
+	if a.Client == nil || a.Runtime == nil || ref == "" {
+		return
+	}
+	if a.Client.HasImage(ctx, ref) {
+		return
+	}
+	rc, err := a.Runtime.ExportImage(ctx, ref)
+	if err != nil {
+		return
+	}
+	defer rc.Close()
+	_ = a.Client.PutImage(ctx, ref, rc)
+}
+
+func (a *Agent) execCommand(ctx context.Context, cmd *client.NodeCommand) error {
+	if cmd == nil {
+		return nil
+	}
+	switch cmd.Kind {
+	case "wipe", "delete":
+		err := a.clearLocal(ctx, false)
+		finishErr := a.finish(ctx, cmd.ID, err)
+		if err != nil {
+			return err
+		}
+		if finishErr != nil {
+			return finishErr
+		}
+		return ErrHalted
+	case "reimage":
+		err := a.clearLocal(ctx, true)
+		finishErr := a.finish(ctx, cmd.ID, err)
+		if err != nil {
+			return err
+		}
+		if finishErr != nil {
+			return finishErr
+		}
+		if a.Reexec != nil {
+			return a.Reexec()
+		}
+		return reexec()
+	default:
+		return nil
+	}
+}
+
+func (a *Agent) finish(ctx context.Context, id string, err error) error {
+	if a.Client == nil || id == "" {
+		return nil
+	}
+	result := "done"
+	if err != nil {
+		result = "error: " + err.Error()
+	}
+	return a.Client.FinishCommand(ctx, id, result)
+}
+
+func (a *Agent) clearLocal(ctx context.Context, keepID bool) error {
+	if a.Runtime != nil {
+		items, err := a.Runtime.List(ctx)
+		if err != nil {
+			return err
+		}
+		for _, c := range items {
+			if strings.HasPrefix(c.Name, "tessera_") || strings.HasPrefix(c.ID, "tessera_") {
+				if err := a.Runtime.Stop(ctx, c.ID); err != nil {
+					return err
+				}
+			}
+		}
+		if err := a.Runtime.Prune(ctx); err != nil {
+			return err
+		}
+	}
+	if a.DataDir != "" {
+		entries, err := os.ReadDir(a.DataDir)
+		if err != nil && !errors.Is(err, os.ErrNotExist) {
+			return err
+		}
+		for _, e := range entries {
+			if err := os.RemoveAll(filepath.Join(a.DataDir, e.Name())); err != nil {
+				return err
+			}
+		}
+	}
+	if keepID && a.ID != "" {
+		return a.writeCache(diskCache{NodeID: a.ID, Epoch: a.maxEpoch})
+	}
+	return nil
+}
+
+func reexec() error {
+	bin, err := os.Executable()
+	if err != nil {
+		return err
+	}
+	return syscall.Exec(bin, os.Args, os.Environ())
 }
 
 func sleep(ctx context.Context, d time.Duration) bool {

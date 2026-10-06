@@ -18,7 +18,7 @@ A new direct module is a roadmap change, not a pull request convenience.
 
 Shipped. One binary, SQLite, LAN join, placement, make-before-break moves, playbook healing, snapshot promotion, read-only MCP, and Kubernetes manifest import.
 
-`install` only writes a unit file. `ask` is one question. `ctr` is present and untested. A cold image pull is not seconds. A Route does not yet follow a move.
+`install` only writes a unit file. `ask` is one question.
 
 ## 0.1.1
 
@@ -32,13 +32,21 @@ The CLI is how you install Tessera, command it, and talk to the agent. One binar
 
 ## 0.2.0
 
-Make the shipped path true on a real machine. The claims in 0.1.0 fail without this.
+The 0.2.0 implementation and local acceptance path are complete on macOS with OrbStack. Runtime work includes the tested containerd runtime, cluster image cache, join benchmark on an hourly cadence, route cutover, and `tessera confirm`. The Docker lab has passed its clean-state release drill on the available local engine.
 
-- Tested containerd runtime. `ctr` is present and untested.
-- Cluster image cache, so a second start of a cached image is seconds, not a registry pull.
-- Join benchmark recorded once, then on a slow cadence, and shown in `tessera get nodes`.
-- Route cutover that follows a move without a client changing address.
-- `tessera confirm` for proposed actions. Wipe, reimage, and delete still do not run by themselves.
+Wipe, reimage, and delete run only after `tessera confirm`. Heal does not run them, even if they are listed in `auto`. Wipe and reimage clear Tessera state on that node. They do not wipe the operating system. Netboot stays unscheduled.
+
+The Docker lab lets someone evaluate Tessera on one machine before using real nodes or cloud accounts. It is a repeatable test environment, not a claim that Docker reproduces a cloud provider.
+
+The lab is in the tree: Compose starts two isolated Docker daemons and agents; a sample app uses a Tessera Route; k6 has five load profiles; scripts inject process, node, latency, HTTP error, and confirmed-delete scenarios; optional registry, PostgreSQL, Redis, and S3-compatible services are available. A small DNS relay lets Tessera workloads use stable Compose service names from both isolated nodes. The sample app checks every optional service through those names. Only the first node receives the sample image initially; the clean-state drill confirms the second node obtains it through Tessera's leader image cache during failover. `lab/lab.sh verify` passed on macOS with OrbStack and a Linux Docker engine. It saves k6 results and removes lab containers and volumes when done.
+
+- One documented start command brings up a controller and at least two isolated Docker-backed nodes. A sample app is placed through Tessera and reached through a Route. Users can replace the sample image and manifest with their own services.
+- Built-in k6 smoke, baseline, spike, soak, and failure runs report latency and error rate with explicit pass criteria. Node-loss runs time Route recovery. Runs use local endpoints and save results for comparison.
+- Repeatable scenarios cover process crashes, node loss and recovery, injected latency and HTTP errors, route continuity, and confirmed destructive actions. The suite shows assignments and actions so a user can see why behavior changed.
+- Optional local dependencies represent common cloud building blocks: a registry, PostgreSQL, Redis, and S3-compatible object storage. They require no cloud credentials and are opt-in so the basic lab stays small.
+- The release drill starts the lab from a clean state, verifies the sample service and failover, runs a short k6 check, and tears down its own containers and volumes. The README documents Docker Desktop and Linux requirements and the differences from real cloud infrastructure.
+
+Docker Desktop and native Linux host compatibility are unverified. Before advertising support for either platform, run `go test ./... -count=1` and `sh lab/lab.sh verify` there. Both runs must exit successfully, show all optional service checks as true before and after failover, and leave no lab containers. The verified local path uses OrbStack's Linux Docker engine; its nested node daemons, service-name DNS, and image-cache transfer passed. Keep provider API emulation out of the default lab until a specific provider workflow is needed.
 
 ## 0.3.0
 

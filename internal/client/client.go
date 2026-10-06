@@ -57,16 +57,22 @@ type HeartbeatRequest struct {
 }
 
 type HeartbeatResponse struct {
-	Epoch         uint64    `json:"epoch"`
-	LeaderID      string    `json:"leader_id"`
-	Expires       time.Time `json:"expires"`
-	Leading       bool      `json:"leading"`
-	Prune         bool      `json:"prune"`
-	CertPEM       string    `json:"cert_pem,omitempty"`
-	KeyPEM        string    `json:"key_pem,omitempty"`
-	NotBefore     time.Time `json:"not_before,omitempty"`
-	NotAfter      time.Time `json:"not_after,omitempty"`
-	SnapshotIndex uint64    `json:"snapshot_index"`
+	Epoch         uint64       `json:"epoch"`
+	LeaderID      string       `json:"leader_id"`
+	Expires       time.Time    `json:"expires"`
+	Leading       bool         `json:"leading"`
+	Prune         bool         `json:"prune"`
+	CertPEM       string       `json:"cert_pem,omitempty"`
+	KeyPEM        string       `json:"key_pem,omitempty"`
+	NotBefore     time.Time    `json:"not_before,omitempty"`
+	NotAfter      time.Time    `json:"not_after,omitempty"`
+	SnapshotIndex uint64       `json:"snapshot_index"`
+	Command       *NodeCommand `json:"command,omitempty"`
+}
+
+type NodeCommand struct {
+	ID   string `json:"id"`
+	Kind string `json:"kind"`
 }
 
 type StatusReport struct {
@@ -166,6 +172,53 @@ func (c *Client) Logs(ctx context.Context, name string) (string, error) {
 	return out.Logs, err
 }
 
+func (c *Client) Confirm(ctx context.Context, id string) (string, error) {
+	var out struct {
+		Result string `json:"result"`
+	}
+	err := c.post(ctx, "/v1/actions/"+url.PathEscape(id)+"/confirm", map[string]string{}, &out)
+	return out.Result, err
+}
+
+func (c *Client) FinishCommand(ctx context.Context, id, result string) error {
+	return c.post(ctx, "/v1/actions/"+url.PathEscape(id)+"/result", map[string]string{"result": result}, nil)
+}
+
+func (c *Client) HasImage(ctx context.Context, ref string) bool {
+	resp, err := c.do(ctx, http.MethodHead, "/v1/images?ref="+url.QueryEscape(ref), nil)
+	if err != nil {
+		return false
+	}
+	resp.Body.Close()
+	return resp.StatusCode == http.StatusOK
+}
+
+func (c *Client) GetImage(ctx context.Context, ref string) (io.ReadCloser, error) {
+	resp, err := c.do(ctx, http.MethodGet, "/v1/images?ref="+url.QueryEscape(ref), nil)
+	if err != nil {
+		return nil, err
+	}
+	if resp.StatusCode >= 300 {
+		b, _ := io.ReadAll(io.LimitReader(resp.Body, 1024))
+		resp.Body.Close()
+		return nil, fmt.Errorf("GET image: %s", strings.TrimSpace(string(b)))
+	}
+	return resp.Body, nil
+}
+
+func (c *Client) PutImage(ctx context.Context, ref string, r io.Reader) error {
+	resp, err := c.do(ctx, http.MethodPut, "/v1/images?ref="+url.QueryEscape(ref), r)
+	if err != nil {
+		return err
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode >= 300 {
+		b, _ := io.ReadAll(io.LimitReader(resp.Body, 1024))
+		return fmt.Errorf("PUT image: %s", strings.TrimSpace(string(b)))
+	}
+	return nil
+}
+
 func (c *Client) Act(ctx context.Context, kind, target, reason string) (string, error) {
 	var out struct {
 		Result string `json:"result"`
@@ -245,6 +298,20 @@ func (c *Client) post(ctx context.Context, path string, body any, dest any) erro
 		return nil
 	}
 	return json.Unmarshal(resp, dest)
+}
+
+func (c *Client) do(ctx context.Context, method, path string, body io.Reader) (*http.Response, error) {
+	req, err := http.NewRequestWithContext(ctx, method, c.Base+path, body)
+	if err != nil {
+		return nil, err
+	}
+	if c.Token != "" {
+		req.Header.Set("Authorization", "Bearer "+c.Token)
+	}
+	if c.HTTP == nil {
+		c.HTTP = http.DefaultClient
+	}
+	return c.HTTP.Do(req)
 }
 
 func (c *Client) call(ctx context.Context, method, path string, body []byte, auth bool) ([]byte, error) {

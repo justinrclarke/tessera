@@ -12,10 +12,16 @@ type Proxy struct {
 	lns   map[int]net.Listener
 	backs map[string]string
 	names map[int]string
+	conns map[int]map[net.Conn]struct{}
 }
 
 func New() *Proxy {
-	return &Proxy{lns: map[int]net.Listener{}, backs: map[string]string{}, names: map[int]string{}}
+	return &Proxy{
+		lns:   map[int]net.Listener{},
+		backs: map[string]string{},
+		names: map[int]string{},
+		conns: map[int]map[net.Conn]struct{}{},
+	}
 }
 
 func (p *Proxy) Set(name string, port int, backend string) error {
@@ -24,6 +30,9 @@ func (p *Proxy) Set(name string, port int, backend string) error {
 	}
 	p.mu.Lock()
 	defer p.mu.Unlock()
+	if p.backs[name] != backend {
+		p.dropLocked(port)
+	}
 	p.backs[name] = backend
 	if _, ok := p.lns[port]; ok {
 		p.names[port] = name
@@ -58,11 +67,22 @@ func (p *Proxy) serve(ln net.Listener, port int) {
 }
 
 func (p *Proxy) pipe(c net.Conn, port int) {
-	defer c.Close()
 	p.mu.Lock()
+	if p.conns[port] == nil {
+		p.conns[port] = map[net.Conn]struct{}{}
+	}
+	p.conns[port][c] = struct{}{}
 	name := p.names[port]
 	backend := p.backs[name]
 	p.mu.Unlock()
+	defer func() {
+		p.mu.Lock()
+		if set := p.conns[port]; set != nil {
+			delete(set, c)
+		}
+		p.mu.Unlock()
+		c.Close()
+	}()
 	if backend == "" {
 		return
 	}
@@ -73,4 +93,10 @@ func (p *Proxy) pipe(c net.Conn, port int) {
 	defer up.Close()
 	go io.Copy(up, c)
 	_, _ = io.Copy(c, up)
+}
+
+func (p *Proxy) dropLocked(port int) {
+	for c := range p.conns[port] {
+		_ = c.Close()
+	}
 }

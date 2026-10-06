@@ -14,7 +14,7 @@ Module `tessera`. One binary: `cmd/tessera`. No Makefile or CI. Verify with `go 
 ## Behavior that is easy to break
 
 - Healing is `diagnose.Scan` plus `policy.Decide`. Do not put an LLM on that path. `ask` may call `TESSERA_LLM_URL` after the deterministic text.
-- `wipe`, `reimage`, and `delete` always return `confirm`, even if listed in `Auto`.
+- `wipe`, `reimage`, and `delete` always return `confirm`, even if listed in `Auto`. They run only from `tessera confirm`.
 - A move starts a replacement (`Assignment.Replaces`) and stops the old one only after the replacement is `running`. Do not stop first.
 - `api.Active` is true for `failed`. Only `stopped` and `succeeded` drop out of the desired set.
 - `PutApp` bumps generation only when `ReleaseEqual` is false. Rollback restores `HealthyGeneration` from `app_history`.
@@ -24,7 +24,10 @@ Module `tessera`. One binary: `cmd/tessera`. No Makefile or CI. Verify with `go 
 
 ## Runtime and process
 
-- `--runtime auto` uses the Docker socket if it exists, else `/var/run/containerd/containerd.sock` plus `ctr`. `ctr` is untested. Drills and unit tests use `fake`.
+- `--runtime auto` uses the Docker socket if it exists, else `/var/run/containerd/containerd.sock` plus `ctr`. `ctr` is covered by scripted command tests. Drills and unit tests use `fake`.
+- A route listen port stays fixed. Cutover follows a running replacement.
+- The image cache is files under the leader data directory, not rows in SQLite. A second start of a cached image does not pull from the registry.
+- Join benchmark is stored in the agent cache, refreshed hourly, and shown by `tessera get nodes`.
 - Docker list/stop only sees names prefixed `tessera_`.
 - `tessera up` re-execs under the watchdog unless `TESSERA_WATCHED=1` or `--watched`. The watchdog does not restart a clean exit or a child that dies within 500ms.
 - CLI state is `$TESSERA_DATA` or `~/.tessera`: `client.json` (url, token), `tessera.db`, `agent/cache.json`. Override with `TESSERA_URL` and `TESSERA_TOKEN`.

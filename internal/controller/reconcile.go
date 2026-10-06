@@ -296,25 +296,63 @@ func (s *Server) syncProxyLocked() {
 	}
 	asgs, _ := s.Store.ListAssignments()
 	nodes, _ := s.Store.ListNodes()
+	for _, r := range routes {
+		_ = s.proxy.Set(r.Name, r.Port, routeBackend(r, asgs, nodes))
+	}
+}
+
+func routeBackend(r api.Route, asgs []api.Assignment, nodes []api.Node) string {
 	byNode := map[string]api.Node{}
 	for _, n := range nodes {
 		byNode[n.ID] = n
 	}
-	for _, r := range routes {
-		backend := ""
-		for _, asg := range asgs {
-			if asg.App != r.App || asg.Status != api.StatusRunning || asg.HostPort == 0 {
-				continue
-			}
-			host := "127.0.0.1"
-			if n, ok := byNode[asg.NodeID]; ok && n.Addr != "" {
-				host = n.Addr
-			}
-			backend = net.JoinHostPort(host, strconv.Itoa(asg.HostPort))
-			break
+	var best api.Assignment
+	found := false
+	for _, asg := range asgs {
+		if asg.App != r.App || asg.Status != api.StatusRunning {
+			continue
 		}
-		_ = s.proxy.Set(r.Name, r.Port, backend)
+		port := asg.HostPort
+		if port == 0 {
+			port = r.TargetPort
+		}
+		if port == 0 {
+			continue
+		}
+		asg.HostPort = port
+		if !found || routePrefer(asg, best) {
+			best = asg
+			found = true
+		}
 	}
+	if !found {
+		return ""
+	}
+	host := "127.0.0.1"
+	if n, ok := byNode[best.NodeID]; ok {
+		host = hostOnly(n.Addr)
+	}
+	return net.JoinHostPort(host, strconv.Itoa(best.HostPort))
+}
+
+func routePrefer(a, b api.Assignment) bool {
+	if a.Replaces != "" && b.Replaces == "" {
+		return true
+	}
+	if a.Replaces == "" && b.Replaces != "" {
+		return false
+	}
+	return a.Updated.After(b.Updated)
+}
+
+func hostOnly(addr string) string {
+	if addr == "" {
+		return "127.0.0.1"
+	}
+	if h, _, err := net.SplitHostPort(addr); err == nil && h != "" {
+		return h
+	}
+	return addr
 }
 
 func (s *Server) recordLocked(now time.Time, kind, target, reason, result string) error {

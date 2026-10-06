@@ -2,6 +2,7 @@ package runtime
 
 import (
 	"context"
+	"io"
 	"os"
 
 	"tessera/internal/api"
@@ -33,6 +34,9 @@ type Runtime interface {
 	List(ctx context.Context) ([]Container, error)
 	Logs(ctx context.Context, id string) (string, error)
 	Prune(ctx context.Context) error
+	HasImage(ctx context.Context, ref string) (bool, error)
+	ExportImage(ctx context.Context, ref string) (io.ReadCloser, error)
+	ImportImage(ctx context.Context, ref string, r io.Reader) error
 }
 
 func Open(kind string) (Runtime, error) {
@@ -42,13 +46,13 @@ func Open(kind string) (Runtime, error) {
 	case "docker":
 		return NewDocker(DockerSock()), nil
 	case "ctr":
-		return NewCTR(), nil
+		return NewCTR("/var/run/containerd/containerd.sock"), nil
 	default:
 		if _, err := os.Stat(DockerSock()); err == nil {
 			return NewDocker(DockerSock()), nil
 		}
 		if _, err := os.Stat("/var/run/containerd/containerd.sock"); err == nil {
-			return NewCTR(), nil
+			return NewCTR("/var/run/containerd/containerd.sock"), nil
 		}
 		return nil, os.ErrNotExist
 	}
