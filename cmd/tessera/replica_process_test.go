@@ -3,17 +3,24 @@ package main
 import (
 	"context"
 	"encoding/json"
+	"fmt"
+	"io"
 	"net"
+	"net/http"
+	"net/http/httptest"
 	"os"
 	"os/exec"
 	"path/filepath"
+	"strconv"
 	"strings"
+	"sync/atomic"
 	"testing"
 	"time"
 
 	"tessera/internal/agent"
 	"tessera/internal/api"
 	"tessera/internal/client"
+	"tessera/internal/gateway"
 	"tessera/internal/runtime"
 )
 
@@ -49,7 +56,7 @@ func TestControllerProcessesSurviveAbruptLeaderAndQuorumLoss(t *testing.T) {
 	defer cancel()
 	var listeners []net.Listener
 	var addresses []string
-	for i := 0; i < 6; i++ {
+	for i := 0; i < 8; i++ {
 		ln, err := net.Listen("tcp", "127.0.0.1:0")
 		if err != nil {
 			t.Fatal(err)
@@ -138,11 +145,18 @@ func TestControllerProcessesSurviveAbruptLeaderAndQuorumLoss(t *testing.T) {
 		return false
 	})
 	cl := client.New(strings.Join(urls, ","), "process-test-token")
-	if err := cl.Apply(ctx, []byte("kind: App\nname: steady\nimage: steady\n")); err != nil {
+	backend := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) { io.WriteString(w, "steady") }))
+	defer backend.Close()
+	_, backendText, _ := net.SplitHostPort(backend.Listener.Addr().String())
+	_, routeText, _ := net.SplitHostPort(addresses[6])
+	_, gatewayText, _ := net.SplitHostPort(addresses[7])
+	gatewayPort, _ := strconv.Atoi(gatewayText)
+	manifest := fmt.Sprintf("kind: App\nname: steady\nimage: steady\nports: [{container: 80, host: %s}]\nhealth: {path: /ready, port: 80}\n---\nkind: Route\nname: steady\napp: steady\nport: %s\ntarget_port: 80\n", backendText, routeText)
+	if err := cl.Apply(ctx, []byte(manifest)); err != nil {
 		t.Fatal(err)
 	}
 	rtm := &countedRuntime{Fake: runtime.NewFake()}
-	ag := &agent.Agent{ID: "worker", DataDir: filepath.Join(root, "agent"), Client: cl, Token: cl.Token, Runtime: rtm}
+	ag := &agent.Agent{ID: "worker", DataDir: filepath.Join(root, "agent"), Client: cl, Token: cl.Token, Runtime: rtm, Addr: "127.0.0.1"}
 	if err := ag.Tick(ctx); err != nil {
 		t.Fatal(err)
 	}
@@ -150,6 +164,53 @@ func TestControllerProcessesSurviveAbruptLeaderAndQuorumLoss(t *testing.T) {
 	if err != nil || len(before) != 1 || before[0].Status != api.StatusRunning {
 		t.Fatalf("initial workload: %+v %v", before, err)
 	}
+	g := &gateway.Gateway{Client: client.New(strings.Join(urls, ","), cl.Token), Route: "steady", Port: gatewayPort}
+	if err := g.Sync(ctx); err != nil {
+		t.Fatal(err)
+	}
+	gatewayCtx, stopGateway := context.WithCancel(ctx)
+	gatewayDone := make(chan error, 1)
+	go func() { gatewayDone <- g.Run(gatewayCtx) }()
+	trafficDone := make(chan struct{})
+	trafficFailures := make(chan error, 1)
+	var requests atomic.Int64
+	go func() {
+		defer close(trafficDone)
+		transport := &http.Transport{DisableKeepAlives: true}
+		defer transport.CloseIdleConnections()
+		httpClient := &http.Client{Timeout: time.Second, Transport: transport}
+		for gatewayCtx.Err() == nil {
+			resp, err := httpClient.Get(fmt.Sprintf("http://127.0.0.1:%d/", gatewayPort))
+			if err == nil {
+				body, readErr := io.ReadAll(resp.Body)
+				resp.Body.Close()
+				if readErr != nil || resp.StatusCode != http.StatusOK || string(body) != "steady" {
+					err = fmt.Errorf("route returned %d %q: %v", resp.StatusCode, body, readErr)
+				}
+			}
+			if err != nil {
+				if gatewayCtx.Err() == nil {
+					trafficFailures <- err
+				}
+				return
+			}
+			requests.Add(1)
+			time.Sleep(10 * time.Millisecond)
+		}
+	}()
+	t.Cleanup(func() { stopGateway(); <-trafficDone; <-gatewayDone })
+	checkTraffic := func() {
+		t.Helper()
+		select {
+		case err := <-trafficFailures:
+			t.Fatalf("stable address lost HTTP traffic: %v", err)
+		default:
+		}
+		if requests.Load() == 0 {
+			t.Fatal("no HTTP requests passed through gateway")
+		}
+	}
+	wait(func() bool { return requests.Load() > 0 })
 	stop(leader)
 	if err := ag.Tick(ctx); err != nil {
 		t.Fatal(err)
@@ -158,6 +219,7 @@ func TestControllerProcessesSurviveAbruptLeaderAndQuorumLoss(t *testing.T) {
 	if err != nil || len(after) != 1 || after[0].ID != before[0].ID || after[0].Epoch <= before[0].Epoch || rtm.starts != 1 || rtm.stops != 0 {
 		t.Fatalf("abrupt leader loss restarted work: %+v starts=%d stops=%d err=%v", after, rtm.starts, rtm.stops, err)
 	}
+	checkTraffic()
 	next := -1
 	wait(func() bool {
 		for i, process := range processes {
@@ -177,6 +239,7 @@ func TestControllerProcessesSurviveAbruptLeaderAndQuorumLoss(t *testing.T) {
 	if err == nil {
 		t.Fatal("one remaining process committed a mutation")
 	}
+	checkTraffic()
 	start(leader, false)
 	wait(func() bool {
 		for i, process := range processes {
@@ -195,6 +258,8 @@ func TestControllerProcessesSurviveAbruptLeaderAndQuorumLoss(t *testing.T) {
 	if err != nil || app.Image != "steady" || rtm.starts != 1 || rtm.stops != 0 {
 		t.Fatalf("quorum recovery changed running work: %+v starts=%d stops=%d err=%v", app, rtm.starts, rtm.stops, err)
 	}
+	checkTraffic()
+	t.Logf("%d HTTP requests survived abrupt controller and quorum loss at one address", requests.Load())
 }
 
 func TestReplicaControllerProcessHelper(t *testing.T) {

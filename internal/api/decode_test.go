@@ -48,3 +48,15 @@ func TestManifestRejectsIgnoredSettingsAndAllowsScaleToZero(t *testing.T) {
 		t.Fatalf("valid nested move policy rejected: %v", err)
 	}
 }
+
+func TestHTTPReadinessManifest(t *testing.T) {
+	base := "kind: App\nname: web\nimage: nginx\nports: [{container: 80}]\n"
+	if _, err := DecodeOne([]byte(base + "health: {path: /ready, port: 80, timeout: 500ms, startup_timeout: 30s}\n")); err != nil {
+		t.Fatal(err)
+	}
+	for _, health := range []string{"{path: //other/ready, port: 80}", "{path: /ready, port: 90}", "{path: /ready, port: 80, timeout: -1s}", "{path: /ready, port: 80, startup_timeout: never}"} {
+		if _, err := DecodeOne([]byte(base + "health: " + health)); err == nil {
+			t.Fatalf("accepted invalid readiness: %s", health)
+		}
+	}
+}

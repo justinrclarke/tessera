@@ -100,3 +100,104 @@ func TestReplicasCanShareOneNodeAndScale(t *testing.T) {
 		}
 	}
 }
+
+func TestConfigAndSecretRolloutRetainsRollbackValues(t *testing.T) {
+	srv, cl := standaloneClient(t)
+	ctx := context.Background()
+	if _, err := cl.Register(ctx, client.RegisterRequest{ID: "node"}); err != nil {
+		t.Fatal(err)
+	}
+	body := "kind: App\nname: web\nimage: nginx\nconfigs: [settings]\nsecrets: [credentials]\n---\nkind: Config\nname: settings\ndata: {MODE: old}\n---\nkind: Secret\nname: credentials\ndata: {PASSWORD: original}\n"
+	if err := cl.Apply(ctx, []byte(body)); err != nil {
+		t.Fatal(err)
+	}
+	asgs, _ := srv.Store.ListAssignments()
+	if len(asgs) != 1 || asgs[0].Env["MODE"] != "old" || asgs[0].Env["PASSWORD"] != "original" {
+		t.Fatalf("unresolved release: %+v", asgs)
+	}
+	if err := cl.Report(ctx, asgs[0].ID, client.StatusReport{Status: api.StatusRunning}); err != nil {
+		t.Fatal(err)
+	}
+	for _, generation := range []int64{2, 3} {
+		if err := cl.Apply(ctx, []byte("kind: Secret\nname: credentials\ndata: {PASSWORD: changed}\n")); err != nil {
+			t.Fatal(err)
+		}
+		app, _ := cl.GetApp(ctx, "web")
+		if app.Generation != generation || app.ReleaseEnv != nil {
+			t.Fatalf("generation or public secret exposure: %+v", app)
+		}
+		asgs, _ = srv.Store.ListAssignments()
+		id := ""
+		for _, a := range asgs {
+			if a.Generation == generation && api.Active(a.Status) {
+				id = a.ID
+				if a.Env["PASSWORD"] != "changed" {
+					t.Fatalf("new release env: %+v", a)
+				}
+			}
+		}
+		if id == "" {
+			t.Fatalf("no replacement generation %d", generation)
+		}
+		if err := cl.Report(ctx, id, client.StatusReport{Status: api.StatusFailed, Reason: "crash"}); err != nil {
+			t.Fatal(err)
+		}
+		app, _ = srv.Store.GetApp("web")
+		if app.Generation != 1 || app.ReleaseEnv["PASSWORD"] != "original" {
+			t.Fatalf("rollback lost immutable secret: %+v", app)
+		}
+	}
+	asgs, _ = srv.Store.ListAssignments()
+	running := 0
+	for _, a := range asgs {
+		if a.Status == api.StatusRunning && a.Generation == 1 && a.Env["PASSWORD"] == "original" {
+			running++
+		}
+	}
+	if running != 1 {
+		t.Fatalf("config failures stopped healthy service: %+v", asgs)
+	}
+}
+
+func TestApplyFailureIsAtomic(t *testing.T) {
+	srv, cl := standaloneClient(t)
+	ctx := context.Background()
+	if err := cl.Apply(ctx, []byte("kind: Config\nname: settings\ndata: {MODE: original}\n")); err != nil {
+		t.Fatal(err)
+	}
+	body := "kind: Config\nname: settings\ndata: {MODE: changed}\n---\nkind: App\nname: web\nimage: nginx\nconfigs: [missing]\n"
+	if err := cl.Apply(ctx, []byte(body)); err == nil {
+		t.Fatal("missing config was accepted")
+	}
+	settings, _ := srv.Store.GetConfig("settings")
+	apps, _ := srv.Store.ListApps()
+	if settings.Data["MODE"] != "original" || len(apps) != 0 {
+		t.Fatalf("failed apply partially committed: %+v %+v", settings, apps)
+	}
+}
+
+func TestGenerationBecomesHealthyOnlyAfterAllReplicasAreReady(t *testing.T) {
+	srv, cl := standaloneClient(t)
+	ctx := context.Background()
+	if _, err := cl.Register(ctx, client.RegisterRequest{ID: "node"}); err != nil {
+		t.Fatal(err)
+	}
+	if err := cl.Apply(ctx, []byte("kind: App\nname: web\nimage: nginx\nreplicas: 2\n")); err != nil {
+		t.Fatal(err)
+	}
+	asgs, _ := srv.Store.ListAssignments()
+	if err := cl.Report(ctx, asgs[0].ID, client.StatusReport{Status: api.StatusRunning}); err != nil {
+		t.Fatal(err)
+	}
+	app, _ := srv.Store.GetApp("web")
+	if app.HealthyGeneration != 0 {
+		t.Fatal("one ready replica marked the entire generation healthy")
+	}
+	if err := cl.Report(ctx, asgs[1].ID, client.StatusReport{Status: api.StatusRunning}); err != nil {
+		t.Fatal(err)
+	}
+	app, _ = srv.Store.GetApp("web")
+	if app.HealthyGeneration != 1 {
+		t.Fatalf("ready generation not saved: %+v", app)
+	}
+}

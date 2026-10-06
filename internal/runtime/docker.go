@@ -88,8 +88,8 @@ func (d *Docker) Start(ctx context.Context, spec Spec) (Container, error) {
 	}
 	c := Container{ID: created.ID, Name: spec.Name, Running: true}
 	if inspected, err := d.inspect(ctx, created.ID); err == nil {
-		c.HostPort = inspected.HostPort
-		c.Running = inspected.Running
+		c = inspected
+		c.Name = spec.Name
 	}
 	return c, nil
 }

@@ -49,7 +49,7 @@ func session(in io.Reader, out, errs io.Writer, command func([]string) error, qu
 				}
 				if len(args) == 0 || !sessionCommand(args[0]) {
 					err = fmt.Errorf("enter a CLI command such as get apps, or a question")
-				} else if args[0] == "up" || args[0] == "agent" || args[0] == "controller" || args[0] == "watchdog" || args[0] == "mcp" || args[0] == "session" {
+				} else if args[0] == "up" || args[0] == "agent" || args[0] == "gateway" || args[0] == "controller" || args[0] == "watchdog" || args[0] == "mcp" || args[0] == "session" {
 					err = fmt.Errorf("run tessera %s in a separate terminal", args[0])
 				} else if sessionStdin(args) {
 					err = fmt.Errorf("use a file path in the session; -f - reads the session input")
@@ -68,7 +68,7 @@ func session(in io.Reader, out, errs io.Writer, command func([]string) error, qu
 
 func sessionCommand(word string) bool {
 	switch word {
-	case "help", "-h", "--help", "version", "apply", "get", "confirm", "ask", "import", "backup", "restore", "cloud", "infra", "install", "drill", "up", "agent", "controller", "watchdog", "mcp", "session":
+	case "help", "-h", "--help", "version", "apply", "get", "confirm", "ask", "import", "backup", "restore", "cloud", "infra", "install", "drill", "up", "agent", "gateway", "controller", "watchdog", "mcp", "session":
 		return true
 	}
 	return false

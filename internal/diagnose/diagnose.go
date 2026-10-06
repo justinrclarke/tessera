@@ -96,7 +96,7 @@ func Scan(apps []api.App, nodes []api.Node, asgs []api.Assignment, maxRestarts i
 }
 
 func classify(asg api.Assignment, app api.App, maxRestarts int) (string, string) {
-	if app.HealthyGeneration > 0 && app.Generation > app.HealthyGeneration {
+	if asg.Generation == app.Generation && app.HealthyGeneration > 0 && app.Generation > app.HealthyGeneration {
 		return "bad_release", "rollback"
 	}
 	reason := strings.ToLower(asg.Reason)

@@ -52,18 +52,20 @@ type Agent struct {
 	perfScore api.Perf
 	gpuAt     time.Time
 	gpuItems  []api.GPU
+	probes    map[string]probeState
 }
 
 type diskCache struct {
-	Controllers []string         `json:"controllers,omitempty"`
-	NodeID      string           `json:"node_id"`
-	Assignments []api.Assignment `json:"assignments"`
-	Snapshot    api.Snapshot     `json:"snapshot"`
-	SnapBody    string           `json:"snap_body"`
-	Sig         string           `json:"sig"`
-	Epoch       uint64           `json:"epoch"`
-	Perf        api.Perf         `json:"perf,omitempty"`
-	PerfAt      time.Time        `json:"perf_at,omitempty"`
+	Controllers []string              `json:"controllers,omitempty"`
+	NodeID      string                `json:"node_id"`
+	Assignments []api.Assignment      `json:"assignments"`
+	Snapshot    api.Snapshot          `json:"snapshot"`
+	SnapBody    string                `json:"snap_body"`
+	Sig         string                `json:"sig"`
+	Epoch       uint64                `json:"epoch"`
+	Perf        api.Perf              `json:"perf,omitempty"`
+	PerfAt      time.Time             `json:"perf_at,omitempty"`
+	Probes      map[string]probeState `json:"probes,omitempty"`
 }
 
 var ErrHalted = errors.New("halted")
@@ -278,6 +280,10 @@ func (a *Agent) restore(ctx context.Context) error {
 	if c.NodeID != "" {
 		a.ID = c.NodeID
 	}
+	a.probes = c.Probes
+	if a.probes == nil {
+		a.probes = map[string]probeState{}
+	}
 	if c.Epoch > a.maxEpoch {
 		a.maxEpoch = c.Epoch
 	}
@@ -322,7 +328,7 @@ func (a *Agent) converge(ctx context.Context, desired []api.Assignment, live boo
 		keep = append(keep, d)
 		c, ok := byName[name]
 		if ok && c.Running {
-			a.report(ctx, d, api.StatusRunning, "", c)
+			a.reportReady(ctx, d, c)
 			continue
 		}
 		if ok && !c.Running {
@@ -377,7 +383,7 @@ func (a *Agent) converge(ctx context.Context, desired []api.Assignment, live boo
 			}
 			continue
 		}
-		a.report(ctx, d, api.StatusRunning, "", started)
+		a.reportReady(ctx, d, started)
 		a.publishImage(ctx, d.Image)
 	}
 	if live {
@@ -386,6 +392,11 @@ func (a *Agent) converge(ctx context.Context, desired []api.Assignment, live boo
 			if !want[id] {
 				_ = a.Runtime.Stop(ctx, c.ID)
 			}
+		}
+	}
+	for id := range a.probes {
+		if !want[id] {
+			delete(a.probes, id)
 		}
 	}
 	return a.saveCache(keep)
@@ -486,6 +497,7 @@ func (a *Agent) saveCache(desired []api.Assignment) error {
 	}
 	c.NodeID = a.ID
 	c.Assignments = desired
+	c.Probes = a.probes
 	c.Epoch = a.maxEpoch
 	if a.Client != nil && len(a.Client.Controllers()) > 0 {
 		c.Controllers = a.Client.Controllers()
@@ -524,6 +536,9 @@ func (a *Agent) saveCert(cert, key string) error {
 func (a *Agent) cachePath() string { return filepath.Join(a.DataDir, "cache.json") }
 
 func (a *Agent) init() {
+	if a.probes == nil {
+		a.probes = map[string]probeState{}
+	}
 	if a.restarts == nil {
 		a.restarts = map[string]int{}
 	}

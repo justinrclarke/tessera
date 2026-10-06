@@ -3,7 +3,9 @@ package api
 import (
 	"bytes"
 	"fmt"
+	"net/url"
 	"strings"
+	"time"
 
 	"gopkg.in/yaml.v3"
 )
@@ -141,7 +143,22 @@ func decodeApp(raw map[string]any, kind string) (App, error) {
 		return App{}, fmt.Errorf("app %s: resources cannot be negative", app.Name)
 	}
 	if app.Health != nil {
-		return App{}, fmt.Errorf("app %s: health probes are not implemented", app.Name)
+		h := app.Health
+		u, err := url.ParseRequestURI(h.Path)
+		if err != nil || !strings.HasPrefix(h.Path, "/") || strings.HasPrefix(h.Path, "//") || u.Host != "" || u.Fragment != "" || app.Kind == KindJob {
+			return App{}, fmt.Errorf("app %s: health requires an HTTP path on an App", app.Name)
+		}
+		if len(app.Ports) != 1 || h.Port != app.Ports[0].Container {
+			return App{}, fmt.Errorf("app %s: health port must match the single published container port", app.Name)
+		}
+		for _, value := range []string{h.Timeout, h.StartupTimeout} {
+			if value != "" {
+				d, err := time.ParseDuration(value)
+				if err != nil || d <= 0 {
+					return App{}, fmt.Errorf("app %s: health timeouts must be positive durations", app.Name)
+				}
+			}
+		}
 	}
 	for _, port := range app.Ports {
 		if port.Container < 1 || port.Container > 65535 || port.Host < 0 || port.Host > 65535 || (port.Protocol != "" && !strings.EqualFold(port.Protocol, "tcp")) {

@@ -69,7 +69,7 @@ func Plan(in Input) Result {
 			stop[asg.ID] = true
 			continue
 		}
-		if asg.Generation != app.Generation {
+		if asg.Generation != app.Generation && (app.Kind == api.KindJob || (asg.Status != api.StatusRunning && asg.Status != api.StatusStarting)) {
 			stop[asg.ID] = true
 			continue
 		}
@@ -99,6 +99,7 @@ func Plan(in Input) Result {
 	usedGPUs := map[string]int{}
 	usedDevices := map[string]map[string]bool{}
 	load := map[string]int{}
+	usedPorts := map[string]map[int]bool{}
 	active := map[string][]api.Assignment{}
 	for _, asg := range in.Assignments {
 		if stop[asg.ID] || !api.Active(asg.Status) {
@@ -120,6 +121,7 @@ func Plan(in Input) Result {
 			}
 		}
 		load[asg.NodeID]++
+		reservePorts(usedPorts, asg.NodeID, asg.Ports)
 		active[asg.App] = append(active[asg.App], asg)
 	}
 
@@ -157,7 +159,7 @@ func Plan(in Input) Result {
 		if count < app.Replicas {
 			need := app.Replicas - count
 			if app.Gang {
-				placed, ok := gang(app, ready, cur, used, usedGPUs, usedDevices, load, need)
+				placed, ok := gang(app, ready, cur, used, usedGPUs, usedDevices, usedPorts, load, need)
 				if ok {
 					res.Place = append(res.Place, placed...)
 					for _, p := range placed {
@@ -165,11 +167,12 @@ func Plan(in Input) Result {
 						usedGPUs[p.NodeID] += app.GPUs
 						reserveDevices(usedDevices, p.NodeID, p.GPUDevices)
 						load[p.NodeID]++
+						reservePorts(usedPorts, p.NodeID, app.Ports)
 					}
 				}
 			} else {
 				for i := 0; i < need; i++ {
-					n, ok := pick(ready, used, usedGPUs, usedDevices, load, app)
+					n, ok := pick(ready, used, usedGPUs, usedDevices, usedPorts, load, app)
 					if !ok {
 						break
 					}
@@ -179,6 +182,7 @@ func Plan(in Input) Result {
 					usedGPUs[n.ID] += app.GPUs
 					reserveDevices(usedDevices, n.ID, ids)
 					load[n.ID]++
+					reservePorts(usedPorts, n.ID, app.Ports)
 				}
 			}
 		}
@@ -217,13 +221,38 @@ func Plan(in Input) Result {
 				res.Stop = append(res.Stop, cands[i].ID)
 			}
 		}
-		if in.AllowMove && count == app.Replicas {
-			if mv, ok := move(app, cur, ready, used, usedGPUs, usedDevices, load, in); ok {
+		stale := false
+		for _, asg := range cur {
+			if asg.Generation != app.Generation {
+				stale = true
+			}
+		}
+		if stale && extra == 0 && count == app.Replicas && app.Kind != api.KindJob {
+			sort.Slice(cur, func(i, j int) bool { return cur[i].ID < cur[j].ID })
+			for _, old := range cur {
+				if old.Generation == app.Generation {
+					continue
+				}
+				if n, ok := pick(ready, used, usedGPUs, usedDevices, usedPorts, load, app); ok {
+					ids, _ := selectGPUDevices(n, app, usedGPUs[n.ID], usedDevices[n.ID])
+					res.Place = append(res.Place, Placement{App: app.Name, NodeID: n.ID, Generation: app.Generation, Replaces: old.ID, GPUDevices: ids})
+					used[n.ID] = add(used[n.ID], app.Resources)
+					usedGPUs[n.ID] += app.GPUs
+					reserveDevices(usedDevices, n.ID, ids)
+					reservePorts(usedPorts, n.ID, app.Ports)
+					load[n.ID]++
+				}
+				break
+			}
+		}
+		if !stale && in.AllowMove && count == app.Replicas {
+			if mv, ok := move(app, cur, ready, used, usedGPUs, usedDevices, usedPorts, load, in); ok {
 				res.Place = append(res.Place, mv)
 				used[mv.NodeID] = add(used[mv.NodeID], app.Resources)
 				usedGPUs[mv.NodeID] += app.GPUs
 				reserveDevices(usedDevices, mv.NodeID, mv.GPUDevices)
 				load[mv.NodeID]++
+				reservePorts(usedPorts, mv.NodeID, app.Ports)
 			}
 		}
 	}
@@ -231,7 +260,7 @@ func Plan(in Input) Result {
 	return res
 }
 
-func move(app api.App, cur []api.Assignment, ready []api.Node, used map[string]api.Resources, usedGPUs map[string]int, usedDevices map[string]map[string]bool, load map[string]int, in Input) (Placement, bool) {
+func move(app api.App, cur []api.Assignment, ready []api.Node, used map[string]api.Resources, usedGPUs map[string]int, usedDevices map[string]map[string]bool, usedPorts map[string]map[int]bool, load map[string]int, in Input) (Placement, bool) {
 	if app.Kind == api.KindJob {
 		return Placement{}, false
 	}
@@ -267,7 +296,7 @@ func move(app api.App, cur []api.Assignment, ready []api.Node, used map[string]a
 		}
 		_ = all
 	}
-	best, ok := pick(ready, used, usedGPUs, usedDevices, load, app)
+	best, ok := pick(ready, used, usedGPUs, usedDevices, usedPorts, load, app)
 	if !ok || best.ID == oldest.NodeID {
 		return Placement{}, false
 	}
@@ -305,9 +334,9 @@ func Gain(candidate, current api.Perf, sensitive string) float64 {
 	return n/c - 1
 }
 
-func gang(app api.App, ready []api.Node, active []api.Assignment, used map[string]api.Resources, usedGPUs map[string]int, usedDevices map[string]map[string]bool, load map[string]int, need int) ([]Placement, bool) {
+func gang(app api.App, ready []api.Node, active []api.Assignment, used map[string]api.Resources, usedGPUs map[string]int, usedDevices map[string]map[string]bool, usedPorts map[string]map[int]bool, load map[string]int, need int) ([]Placement, bool) {
 	if app.GangFabric == "" {
-		return gangOnNodes(app, ready, used, usedGPUs, usedDevices, load, need)
+		return gangOnNodes(app, ready, used, usedGPUs, usedDevices, usedPorts, load, need)
 	}
 	groups := map[string][]api.Node{}
 	byID := map[string]api.Node{}
@@ -336,17 +365,18 @@ func gang(app api.App, ready []api.Node, active []api.Assignment, used map[strin
 	}
 	sort.Strings(fabrics)
 	for _, fabric := range fabrics {
-		if placed, ok := gangOnNodes(app, groups[fabric], used, usedGPUs, usedDevices, load, need); ok {
+		if placed, ok := gangOnNodes(app, groups[fabric], used, usedGPUs, usedDevices, usedPorts, load, need); ok {
 			return placed, true
 		}
 	}
 	return nil, false
 }
 
-func gangOnNodes(app api.App, ready []api.Node, used map[string]api.Resources, usedGPUs map[string]int, usedDevices map[string]map[string]bool, load map[string]int, need int) ([]Placement, bool) {
+func gangOnNodes(app api.App, ready []api.Node, used map[string]api.Resources, usedGPUs map[string]int, usedDevices map[string]map[string]bool, usedPorts map[string]map[int]bool, load map[string]int, need int) ([]Placement, bool) {
 	u := map[string]api.Resources{}
 	g := map[string]int{}
 	idsUsed := cloneDevices(usedDevices)
+	portsUsed := clonePorts(usedPorts)
 	l := map[string]int{}
 	for k, v := range used {
 		u[k] = v
@@ -359,7 +389,7 @@ func gangOnNodes(app api.App, ready []api.Node, used map[string]api.Resources, u
 	}
 	var out []Placement
 	for i := 0; i < need; i++ {
-		n, ok := pick(ready, u, g, idsUsed, l, app)
+		n, ok := pick(ready, u, g, idsUsed, portsUsed, l, app)
 		if !ok {
 			return nil, false
 		}
@@ -369,15 +399,19 @@ func gangOnNodes(app api.App, ready []api.Node, used map[string]api.Resources, u
 		g[n.ID] += app.GPUs
 		reserveDevices(idsUsed, n.ID, ids)
 		l[n.ID]++
+		reservePorts(portsUsed, n.ID, app.Ports)
 	}
 	return out, true
 }
 
-func pick(nodes []api.Node, used map[string]api.Resources, usedGPUs map[string]int, usedDevices map[string]map[string]bool, load map[string]int, app api.App) (api.Node, bool) {
+func pick(nodes []api.Node, used map[string]api.Resources, usedGPUs map[string]int, usedDevices map[string]map[string]bool, usedPorts map[string]map[int]bool, load map[string]int, app api.App) (api.Node, bool) {
 	var best api.Node
 	found := false
 	for _, n := range nodes {
 		if n.Status != api.NodeReady {
+			continue
+		}
+		if portsConflict(usedPorts[n.ID], app.Ports) {
 			continue
 		}
 		if !fits(n, used[n.ID], usedGPUs[n.ID], usedDevices[n.ID], app) {
@@ -559,4 +593,35 @@ func nodeByID(nodes []api.Node, id string) (api.Node, bool) {
 		}
 	}
 	return api.Node{}, false
+}
+
+func portsConflict(used map[int]bool, ports []api.Port) bool {
+	for _, p := range ports {
+		if p.Host != 0 && used[p.Host] {
+			return true
+		}
+	}
+	return false
+}
+
+func reservePorts(used map[string]map[int]bool, node string, ports []api.Port) {
+	if used[node] == nil {
+		used[node] = map[int]bool{}
+	}
+	for _, p := range ports {
+		if p.Host != 0 {
+			used[node][p.Host] = true
+		}
+	}
+}
+
+func clonePorts(in map[string]map[int]bool) map[string]map[int]bool {
+	out := map[string]map[int]bool{}
+	for node, ports := range in {
+		out[node] = map[int]bool{}
+		for port, used := range ports {
+			out[node][port] = used
+		}
+	}
+	return out
 }

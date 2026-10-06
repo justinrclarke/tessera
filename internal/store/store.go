@@ -60,6 +60,21 @@ func Open(path string) (*Store, error) {
 
 func (s *Store) Close() error { return s.db.Close() }
 
+func (s *Store) Transaction(fn func(*Store) error) error {
+	if s.tx != nil {
+		return fn(s)
+	}
+	tx, err := s.db.Begin()
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback()
+	if err := fn(&Store{db: s.db, tx: tx}); err != nil {
+		return err
+	}
+	return tx.Commit()
+}
+
 func (s *Store) HasResources() (bool, error) {
 	var count int
 	err := s.queryRow(`SELECT (SELECT COUNT(*) FROM apps)+(SELECT COUNT(*) FROM nodes)+(SELECT COUNT(*) FROM assignments)+(SELECT COUNT(*) FROM routes)+(SELECT COUNT(*) FROM configs)+(SELECT COUNT(*) FROM actions)+(SELECT COUNT(*) FROM app_history)`).Scan(&count)
@@ -85,7 +100,14 @@ func (s *Store) PutApp(a api.App) error {
 	prev, err := s.GetApp(a.Name)
 	if err == nil && !prev.ReleaseEqual(a) {
 		if a.Generation <= prev.Generation {
-			a.Generation = prev.Generation + 1
+			var latest int64
+			if err := s.queryRow(`SELECT COALESCE(MAX(generation),0) FROM app_history WHERE name=?`, a.Name).Scan(&latest); err != nil {
+				return err
+			}
+			if latest < prev.Generation {
+				latest = prev.Generation
+			}
+			a.Generation = latest + 1
 		}
 		a.HealthyGeneration = prev.HealthyGeneration
 		if err := s.putHistory(prev); err != nil {
@@ -170,6 +192,9 @@ func (s *Store) Rollback(name string) (api.App, error) {
 	}
 	old.Generation = cur.HealthyGeneration
 	old.HealthyGeneration = cur.HealthyGeneration
+	if err := s.putHistory(cur); err != nil {
+		return api.App{}, err
+	}
 	b, err := json.Marshal(old)
 	if err != nil {
 		return api.App{}, err

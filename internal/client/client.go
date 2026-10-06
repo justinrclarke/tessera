@@ -149,6 +149,12 @@ func (c *Client) Health(ctx context.Context) error {
 	return err
 }
 
+func (c *Client) RouteBackends(ctx context.Context, name string) (api.RouteBackends, error) {
+	var out api.RouteBackends
+	err := c.get(ctx, "/v1/routes/"+url.PathEscape(name)+"/backends", &out)
+	return out, err
+}
+
 func (c *Client) Apply(ctx context.Context, body []byte) error {
 	_, err := c.call(ctx, http.MethodPost, "/v1/apply", body, true)
 	return err
@@ -547,8 +553,15 @@ func (c *Client) call(ctx context.Context, method, path string, body []byte, aut
 			continue
 		}
 		if resp.StatusCode >= 300 {
-			return nil, fmt.Errorf("%s %s: %s", method, path, strings.TrimSpace(string(b)))
+			return nil, &HTTPError{Status: resp.StatusCode, Message: fmt.Sprintf("%s %s: %s", method, path, strings.TrimSpace(string(b)))}
 		}
 		return b, nil
 	}
 }
+
+type HTTPError struct {
+	Status  int
+	Message string
+}
+
+func (e *HTTPError) Error() string { return e.Message }

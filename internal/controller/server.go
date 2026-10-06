@@ -228,6 +228,7 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("POST /v1/actions/{id}/result", s.handleActionResult)
 	mux.HandleFunc("/v1/images", s.handleImage)
 	mux.HandleFunc("GET /v1/routes", s.handleRoutes)
+	mux.HandleFunc("GET /v1/routes/{name}/backends", s.handleRouteBackends)
 	mux.HandleFunc("GET /v1/diagnose", s.handleDiagnose)
 	mux.HandleFunc("POST /v1/ask", s.handleAsk)
 	mux.HandleFunc("GET /v1/snapshot", s.handleSnapshot)

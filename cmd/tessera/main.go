@@ -64,6 +64,8 @@ func run(args []string) error {
 		return cmdController(args[1:])
 	case "agent":
 		return cmdAgent(args[1:])
+	case "gateway":
+		return cmdGateway(args[1:])
 	case "apply":
 		return cmdApply(args[1:])
 	case "get":
@@ -116,6 +118,7 @@ from a signed snapshot if the current one dies. Destructive actions stay propose
   tessera confirm [id]
   tessera ask "why is web down"
   tessera agent [--url http://controller:7468]
+	  tessera gateway --route web [--port 8080]
   tessera controller [--id ID --raft-listen HOST:PORT --peers ID=RAFT_ADDRESS@HTTP_URL,... --bootstrap]
   tessera import -f deploy.yaml
   tessera mcp

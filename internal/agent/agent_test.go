@@ -5,10 +5,14 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
+	"net"
 	"net/http"
 	"net/http/httptest"
 	"os"
 	"path/filepath"
+	"strconv"
+	"strings"
 	"testing"
 	"time"
 
@@ -257,5 +261,45 @@ func TestImmediateExitCannotMarkReleaseHealthy(t *testing.T) {
 				t.Fatalf("exited process marked healthy: %+v", reports)
 			}
 		})
+	}
+}
+
+func TestStartupTimeoutSurvivesAgentRestart(t *testing.T) {
+	probe := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) { w.WriteHeader(http.StatusServiceUnavailable) }))
+	defer probe.Close()
+	_, portText, _ := net.SplitHostPort(probe.Listener.Addr().String())
+	port, _ := strconv.Atoi(portText)
+	var reports []client.StatusReport
+	control := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if strings.HasSuffix(r.URL.Path, "/status") {
+			var report client.StatusReport
+			json.NewDecoder(r.Body).Decode(&report)
+			reports = append(reports, report)
+		}
+		io.WriteString(w, "{}")
+	}))
+	defer control.Close()
+	rtm := runtime.NewFake()
+	dir := t.TempDir()
+	now := time.Now()
+	asg := api.Assignment{ID: "slow", Status: api.StatusPending, Image: "slow", Health: &api.Health{Path: "/ready", Port: 80, StartupTimeout: "5s"}, Ports: []api.Port{{Container: 80, Host: port}}}
+	a := &Agent{DataDir: dir, Runtime: rtm, Client: client.New(control.URL, "token"), Now: func() time.Time { return now }}
+	if err := a.ConvergeForTest(context.Background(), []api.Assignment{asg}, true); err != nil {
+		t.Fatal(err)
+	}
+	if len(reports) != 1 || reports[0].Status != api.StatusStarting {
+		t.Fatalf("unready process marked running: %+v", reports)
+	}
+	now = now.Add(6 * time.Second)
+	restarted := &Agent{DataDir: dir, Runtime: rtm, Client: a.Client, Now: func() time.Time { return now }}
+	if err := restarted.restore(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	if reports[len(reports)-1].Status != api.StatusFailed || !strings.Contains(reports[len(reports)-1].Reason, "startup timeout") {
+		t.Fatalf("restart reset startup deadline: %+v", reports)
+	}
+	items, _ := rtm.List(context.Background())
+	if len(items) != 0 {
+		t.Fatalf("timed-out process kept running: %+v", items)
 	}
 }
