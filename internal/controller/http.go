@@ -17,6 +17,7 @@ import (
 	"tessera/internal/images"
 	"tessera/internal/pki"
 	"tessera/internal/policy"
+	"tessera/internal/store"
 	"tessera/internal/survive"
 )
 
@@ -85,9 +86,37 @@ func (s *Server) apply(objs []api.Object) ([]string, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	var applied []string
+	err := s.Store.Transaction(func(st *store.Store) error {
+		worker := &Server{Store: st}
+		var err error
+		applied, err = worker.applyObjects(objs)
+		return err
+	})
+	return applied, err
+}
+
+func (s *Server) applyObjects(objs []api.Object) ([]string, error) {
+	var applied []string
+	for _, obj := range objs {
+		if obj.Config != nil {
+			if err := s.Store.PutConfig(*obj.Config); err != nil {
+				return nil, err
+			}
+		}
+		if obj.Secret != nil {
+			if err := s.Store.PutSecret(*obj.Secret); err != nil {
+				return nil, err
+			}
+		}
+	}
 	for _, obj := range objs {
 		switch {
 		case obj.App != nil:
+			env, err := s.resolveEnv(*obj.App)
+			if err != nil {
+				return nil, err
+			}
+			obj.App.ReleaseEnv, obj.App.EnvResolved = env, true
 			if err := s.Store.PutApp(*obj.App); err != nil {
 				return nil, err
 			}
@@ -98,20 +127,43 @@ func (s *Server) apply(objs []api.Object) ([]string, error) {
 			}
 			applied = append(applied, "Route/"+obj.Route.Name)
 		case obj.Config != nil:
-			if err := s.Store.PutConfig(*obj.Config); err != nil {
-				return nil, err
-			}
 			applied = append(applied, "Config/"+obj.Config.Name)
 		case obj.Secret != nil:
-			if err := s.Store.PutSecret(*obj.Secret); err != nil {
-				return nil, err
-			}
 			applied = append(applied, "Secret/"+obj.Secret.Name)
 		case obj.Policy != nil:
 			if err := s.Store.SetPolicy(*obj.Policy); err != nil {
 				return nil, err
 			}
 			applied = append(applied, "Policy")
+		}
+	}
+	apps, err := s.Store.ListApps()
+	if err != nil {
+		return nil, err
+	}
+	for _, app := range apps {
+		changed := false
+		for _, obj := range objs {
+			for _, name := range app.Configs {
+				if obj.Config != nil && obj.Config.Name == name {
+					changed = true
+				}
+			}
+			for _, name := range app.Secrets {
+				if obj.Secret != nil && obj.Secret.Name == name {
+					changed = true
+				}
+			}
+		}
+		if changed {
+			env, err := s.resolveEnv(app)
+			if err != nil {
+				return nil, err
+			}
+			app.ReleaseEnv, app.EnvResolved = env, true
+			if err := s.Store.PutApp(app); err != nil {
+				return nil, err
+			}
 		}
 	}
 	return applied, nil
@@ -126,6 +178,10 @@ func (s *Server) handleListApps(w http.ResponseWriter, r *http.Request) {
 	if apps == nil {
 		apps = []api.App{}
 	}
+	for i := range apps {
+		apps[i].ReleaseEnv = nil
+		apps[i].EnvResolved = false
+	}
 	writeJSON(w, http.StatusOK, apps)
 }
 
@@ -135,6 +191,8 @@ func (s *Server) handleGetApp(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "not found", http.StatusNotFound)
 		return
 	}
+	app.ReleaseEnv = nil
+	app.EnvResolved = false
 	writeJSON(w, http.StatusOK, app)
 }
 
@@ -204,10 +262,17 @@ func (s *Server) handleRegister(w http.ResponseWriter, r *http.Request) {
 		Labels: req.Labels, LastSeen: now, DiskFree: req.DiskFree, DiskTotal: req.DiskTotal,
 		CertNotBefore: cert.NotBefore, CertNotAfter: cert.NotAfter, Epoch: s.Epoch(),
 	}
+	s.mu.Lock()
+	if previous, err := s.Store.GetNode(req.ID); err == nil && previous.Status == api.NodeCordoned {
+		n.Status = previous.Status
+		n.CordonedAt = previous.CordonedAt
+	}
 	if err := s.Store.PutNode(n); err != nil {
+		s.mu.Unlock()
 		http.Error(w, err.Error(), http.StatusInternalServerError)
 		return
 	}
+	s.mu.Unlock()
 	_ = s.Reconcile(now)
 	writeJSON(w, http.StatusOK, client.RegisterResponse{
 		CertPEM: string(cert.CertPEM), KeyPEM: string(cert.KeyPEM), CAPem: string(s.ca.CertPEM),
@@ -370,6 +435,18 @@ func (s *Server) handleStatus(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "not found", http.StatusNotFound)
 		return
 	}
+	if !api.Active(asg.Status) && rep.Status != asg.Status {
+		s.mu.Unlock()
+		http.Error(w, "assignment is already terminal", http.StatusConflict)
+		return
+	}
+	switch rep.Status {
+	case api.StatusPending, api.StatusStarting, api.StatusRunning, api.StatusFailed, api.StatusSucceeded:
+	default:
+		s.mu.Unlock()
+		http.Error(w, "invalid assignment status", http.StatusBadRequest)
+		return
+	}
 	asg.Status = rep.Status
 	asg.Reason = rep.Reason
 	asg.Restarts = rep.Restarts
@@ -385,7 +462,19 @@ func (s *Server) handleStatus(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	if rep.Status == api.StatusRunning {
-		_ = s.Store.MarkHealthy(asg.App, asg.Generation)
+		app, err := s.Store.GetApp(asg.App)
+		if err == nil && app.Generation == asg.Generation {
+			asgs, err := s.Store.ListAssignments()
+			ready := 0
+			for _, a := range asgs {
+				if a.App == app.Name && a.Generation == app.Generation && a.Status == api.StatusRunning {
+					ready++
+				}
+			}
+			if err == nil && ready >= app.Replicas {
+				_ = s.Store.MarkHealthy(asg.App, asg.Generation)
+			}
+		}
 	}
 	s.mu.Unlock()
 	_ = s.Reconcile(now)

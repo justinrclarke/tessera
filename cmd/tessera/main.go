@@ -64,6 +64,8 @@ func run(args []string) error {
 		return cmdController(args[1:])
 	case "agent":
 		return cmdAgent(args[1:])
+	case "gateway":
+		return cmdGateway(args[1:])
 	case "apply":
 		return cmdApply(args[1:])
 	case "get":
@@ -112,10 +114,11 @@ from a signed snapshot if the current one dies. Destructive actions stay propose
   tessera install [--url http://controller:7468] [--token TOKEN] [--runtime auto|docker|ctr|fake]
   tessera session
   tessera apply -f app.yaml
-  tessera get apps|nodes|assignments|actions|routes
+  tessera get apps|nodes|assignments|actions|routes|controllers
   tessera confirm [id]
   tessera ask "why is web down"
   tessera agent [--url http://controller:7468]
+	  tessera gateway --route web [--port 8080]
   tessera controller [--id ID --raft-listen HOST:PORT --peers ID=RAFT_ADDRESS@HTTP_URL,... --bootstrap]
   tessera import -f deploy.yaml
   tessera mcp
@@ -391,7 +394,7 @@ func cmdGet(args []string) error {
 		return err
 	}
 	if fs.NArg() < 1 {
-		return fmt.Errorf("usage: tessera get apps|nodes|assignments|actions|routes")
+		return fmt.Errorf("usage: tessera get apps|nodes|assignments|actions|routes|controllers")
 	}
 	cl, err := openClient()
 	if err != nil {
@@ -399,6 +402,8 @@ func cmdGet(args []string) error {
 	}
 	ctx := context.Background()
 	switch fs.Arg(0) {
+	case "controllers", "controller":
+		return getControllers(ctx, cl, os.Stdout)
 	case "apps", "app":
 		if fs.NArg() == 2 {
 			app, err := cl.GetApp(ctx, fs.Arg(1))

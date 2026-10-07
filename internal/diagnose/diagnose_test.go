@@ -9,7 +9,7 @@ import (
 
 func TestBadReleaseRollsBack(t *testing.T) {
 	app := api.App{Name: "web", Generation: 2, HealthyGeneration: 1}
-	asg := api.Assignment{App: "web", NodeID: "a", Status: api.StatusFailed, Reason: "crash", Restarts: 1}
+	asg := api.Assignment{App: "web", Generation: 2, NodeID: "a", Status: api.StatusFailed, Reason: "crash", Restarts: 1}
 	got := Scan([]api.App{app}, nil, []api.Assignment{asg}, 3, time.Now())
 	if len(got) != 1 || got[0].Action != "rollback" || got[0].Class != "bad_release" {
 		t.Fatalf("%+v", got)

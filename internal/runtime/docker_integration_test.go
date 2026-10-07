@@ -47,3 +47,34 @@ func TestDockerSmoke(t *testing.T) {
 		t.Fatal(err)
 	}
 }
+
+func TestDockerJobExitSmoke(t *testing.T) {
+	if os.Getenv("TESSERA_DOCKER_SMOKE") == "" {
+		t.Skip("set TESSERA_DOCKER_SMOKE=1 to use a local Docker daemon")
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+	defer cancel()
+	d := NewDocker(DockerSock())
+	name := "tessera_job_smoke_" + strings.ReplaceAll(time.Now().Format("150405.000000000"), ".", "")
+	c, err := d.Start(ctx, Spec{Name: name, Image: "busybox:latest", Command: []string{"sh", "-c", "echo completed"}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer d.Stop(context.Background(), c.ID)
+	for ctx.Err() == nil {
+		items, err := d.List(ctx)
+		if err != nil {
+			t.Fatal(err)
+		}
+		for _, item := range items {
+			if item.ID == c.ID && !item.Running {
+				if item.ExitCode != 0 || item.OOM {
+					t.Fatalf("successful job reported a failure: %+v", item)
+				}
+				return
+			}
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+	t.Fatal("job did not finish")
+}

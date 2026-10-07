@@ -2,10 +2,11 @@ package api
 
 import "time"
 
-const Version = "0.3.0"
+const Version = "0.4.0"
 
 const (
 	StatusPending   = "pending"
+	StatusStarting  = "starting"
 	StatusRunning   = "running"
 	StatusFailed    = "failed"
 	StatusSucceeded = "succeeded"
@@ -50,8 +51,10 @@ type Port struct {
 }
 
 type Health struct {
-	Path string `json:"path,omitempty" yaml:"path,omitempty"`
-	Port int    `json:"port,omitempty" yaml:"port,omitempty"`
+	Path           string `json:"path,omitempty" yaml:"path,omitempty"`
+	Port           int    `json:"port,omitempty" yaml:"port,omitempty"`
+	Timeout        string `json:"timeout,omitempty" yaml:"timeout,omitempty"`
+	StartupTimeout string `json:"startup_timeout,omitempty" yaml:"startup_timeout,omitempty"`
 }
 
 type App struct {
@@ -76,6 +79,8 @@ type App struct {
 	GangFabric        string            `json:"gang_fabric,omitempty" yaml:"gang_fabric,omitempty"`
 	Configs           []string          `json:"configs,omitempty" yaml:"configs,omitempty"`
 	Secrets           []string          `json:"secrets,omitempty" yaml:"secrets,omitempty"`
+	ReleaseEnv        map[string]string `json:"release_env,omitempty" yaml:"-"`
+	EnvResolved       bool              `json:"env_resolved,omitempty" yaml:"-"`
 }
 
 type Node struct {
@@ -119,6 +124,7 @@ type Assignment struct {
 	GPUs       int               `json:"gpus,omitempty" yaml:"gpus,omitempty"`
 	GPUDevices []string          `json:"gpu_devices,omitempty" yaml:"gpu_devices,omitempty"`
 	Kind       string            `json:"kind" yaml:"kind"`
+	Health     *Health           `json:"health,omitempty" yaml:"health,omitempty"`
 	Updated    time.Time         `json:"updated" yaml:"updated"`
 }
 
@@ -188,6 +194,23 @@ type Lease struct {
 	URL         string    `json:"url,omitempty"`
 }
 
+type ControllerStatus struct {
+	ID           string `json:"id"`
+	URL          string `json:"url"`
+	Role         string `json:"role"`
+	LeaderID     string `json:"leader_id"`
+	Epoch        uint64 `json:"epoch"`
+	CommitIndex  uint64 `json:"commit_index"`
+	AppliedIndex uint64 `json:"applied_index"`
+	Writable     bool   `json:"writable"`
+	Error        string `json:"error,omitempty"`
+}
+
+type RouteBackends struct {
+	Epoch    uint64   `json:"epoch"`
+	Backends []string `json:"backends"`
+}
+
 func (p Policy) Cooldown() time.Duration {
 	d, err := time.ParseDuration(p.MoveCooldown)
 	if err != nil || d == 0 {
@@ -229,6 +252,30 @@ func (p Policy) Lease() time.Duration {
 }
 
 func (a App) ReleaseEqual(b App) bool {
+	if a.Resources != b.Resources || len(a.Ports) != len(b.Ports) || len(a.DependsOn) != len(b.DependsOn) || (a.Health == nil) != (b.Health == nil) {
+		return false
+	}
+	if a.Health != nil && *a.Health != *b.Health {
+		return false
+	}
+	for i := range a.Ports {
+		if a.Ports[i] != b.Ports[i] {
+			return false
+		}
+	}
+	for i := range a.DependsOn {
+		if a.DependsOn[i] != b.DependsOn[i] {
+			return false
+		}
+	}
+	if len(a.ReleaseEnv) != len(b.ReleaseEnv) {
+		return false
+	}
+	for k, v := range a.ReleaseEnv {
+		if bv, ok := b.ReleaseEnv[k]; !ok || bv != v {
+			return false
+		}
+	}
 	if a.Image != b.Image || a.Kind != b.Kind || a.Gang != b.Gang || a.GangFabric != b.GangFabric || a.GPUs != b.GPUs || a.GPUModel != b.GPUModel || a.GPUMemory != b.GPUMemory || a.SensitiveTo != b.SensitiveTo {
 		return false
 	}

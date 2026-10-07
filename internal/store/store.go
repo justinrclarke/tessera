@@ -24,8 +24,25 @@ type Store struct {
 }
 
 func Open(path string) (*Store, error) {
-	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
+	if err := os.MkdirAll(filepath.Dir(path), 0o700); err != nil {
 		return nil, err
+	}
+	f, err := os.OpenFile(path, os.O_CREATE|os.O_RDWR, 0o600)
+	if err != nil {
+		return nil, err
+	}
+	err = f.Chmod(0o600)
+	closeErr := f.Close()
+	if err != nil {
+		return nil, err
+	}
+	if closeErr != nil {
+		return nil, closeErr
+	}
+	for _, suffix := range []string{"-wal", "-shm", "-journal"} {
+		if err := os.Chmod(path+suffix, 0o600); err != nil && !os.IsNotExist(err) {
+			return nil, err
+		}
 	}
 	u := url.URL{Scheme: "file", Path: path, RawQuery: "_pragma=busy_timeout(5000)&_pragma=journal_mode(WAL)"}
 	db, err := sql.Open("sqlite", u.String())
@@ -42,6 +59,21 @@ func Open(path string) (*Store, error) {
 }
 
 func (s *Store) Close() error { return s.db.Close() }
+
+func (s *Store) Transaction(fn func(*Store) error) error {
+	if s.tx != nil {
+		return fn(s)
+	}
+	tx, err := s.db.Begin()
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback()
+	if err := fn(&Store{db: s.db, tx: tx}); err != nil {
+		return err
+	}
+	return tx.Commit()
+}
 
 func (s *Store) HasResources() (bool, error) {
 	var count int
@@ -68,7 +100,14 @@ func (s *Store) PutApp(a api.App) error {
 	prev, err := s.GetApp(a.Name)
 	if err == nil && !prev.ReleaseEqual(a) {
 		if a.Generation <= prev.Generation {
-			a.Generation = prev.Generation + 1
+			var latest int64
+			if err := s.queryRow(`SELECT COALESCE(MAX(generation),0) FROM app_history WHERE name=?`, a.Name).Scan(&latest); err != nil {
+				return err
+			}
+			if latest < prev.Generation {
+				latest = prev.Generation
+			}
+			a.Generation = latest + 1
 		}
 		a.HealthyGeneration = prev.HealthyGeneration
 		if err := s.putHistory(prev); err != nil {
@@ -153,6 +192,9 @@ func (s *Store) Rollback(name string) (api.App, error) {
 	}
 	old.Generation = cur.HealthyGeneration
 	old.HealthyGeneration = cur.HealthyGeneration
+	if err := s.putHistory(cur); err != nil {
+		return api.App{}, err
+	}
 	b, err := json.Marshal(old)
 	if err != nil {
 		return api.App{}, err
@@ -460,9 +502,24 @@ func (s *Store) LoadSnapshot(snap api.Snapshot, epoch uint64) error {
 }
 
 func (s *Store) Backup(path string) error {
+	return backupTo(path, func(query string) error { _, err := s.exec(query); return err })
+}
+
+func backupTo(path string, execute func(string) error) error {
+	f, err := os.OpenFile(path, os.O_CREATE|os.O_EXCL|os.O_WRONLY, 0o600)
+	if err != nil {
+		return err
+	}
+	if err := f.Close(); err != nil {
+		os.Remove(path)
+		return err
+	}
 	q := fmt.Sprintf("VACUUM INTO '%s'", escape(path))
-	_, err := s.exec(q)
-	return err
+	if err := execute(q); err != nil {
+		os.Remove(path)
+		return err
+	}
+	return nil
 }
 
 func BackupFile(source, target string) error {
@@ -473,8 +530,7 @@ func BackupFile(source, target string) error {
 	}
 	defer reader.Close()
 	reader.SetMaxOpenConns(1)
-	_, err = reader.Exec(fmt.Sprintf("VACUUM INTO '%s'", escape(target)))
-	return err
+	return backupTo(target, func(query string) error { _, err := reader.Exec(query); return err })
 }
 
 func RestoreBackup(source, target string, minEpoch uint64) error {

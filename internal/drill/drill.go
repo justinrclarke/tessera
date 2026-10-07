@@ -35,6 +35,7 @@ func Run() ([]Report, error) {
 		{"place and run", placeAndRun},
 		{"dead node reschedules", deadNode},
 		{"bad release rolls back", rollback},
+		{"HTTP readiness preserves service through slow and failed updates", readinessRollout},
 		{"wipe stays proposed", wipeStaysProposed},
 		{"old epoch is ignored", fence},
 		{"cache restores without a controller", restoreCache},

@@ -3,13 +3,13 @@ package controller
 import (
 	"context"
 	"fmt"
-	"net"
 	"strconv"
 	"time"
 
 	"tessera/internal/api"
 	"tessera/internal/diagnose"
 	"tessera/internal/policy"
+	"tessera/internal/proxy"
 	"tessera/internal/schedule"
 	"tessera/internal/survive"
 )
@@ -84,6 +84,11 @@ func (s *Server) healLocked(now time.Time, pol api.Policy) error {
 	findings := diagnose.Scan(apps, nodes, asgs, pol.MaxRestarts, now)
 	for _, f := range findings {
 		reason := f.Class + ":" + f.Reason
+		if f.Action == "rollback" {
+			if app, err := s.Store.GetApp(f.Target); err == nil {
+				reason += fmt.Sprintf(" (generation %d)", app.Generation)
+			}
+		}
 		has, err := s.Store.HasAction(f.Action, f.Target, reason)
 		if err != nil {
 			return err
@@ -167,9 +172,6 @@ func (s *Server) scheduleLocked(now time.Time, pol api.Policy) error {
 		changed = true
 	}
 	for _, p := range plan.Place {
-		if hasPlacement(asgs, p) {
-			continue
-		}
 		asg, err := s.assignmentFrom(p, now)
 		if err != nil {
 			return err
@@ -180,9 +182,14 @@ func (s *Server) scheduleLocked(now time.Time, pol api.Policy) error {
 		asgs = append(asgs, asg)
 		changed = true
 		if p.Replaces != "" {
-			s.lastMove[p.App] = now
-			_ = s.Store.SetMeta("move:"+p.App, strconv.FormatInt(now.Unix(), 10))
-			_ = s.recordLocked(now, "move", p.App, "faster node "+p.NodeID, "done")
+			old, err := s.Store.GetAssignment(p.Replaces)
+			if err == nil && old.Generation != p.Generation {
+				_ = s.recordLocked(now, "rollout", p.App, "starting replacement generation", "done")
+			} else {
+				s.lastMove[p.App] = now
+				_ = s.Store.SetMeta("move:"+p.App, strconv.FormatInt(now.Unix(), 10))
+				_ = s.recordLocked(now, "move", p.App, "faster node "+p.NodeID, "done")
+			}
 		}
 	}
 	if changed {
@@ -221,11 +228,19 @@ func (s *Server) assignmentFrom(p schedule.Placement, now time.Time) (api.Assign
 		GPUs:       app.GPUs,
 		GPUDevices: p.GPUDevices,
 		Kind:       app.Kind,
+		Health:     app.Health,
 		Updated:    now,
 	}, nil
 }
 
 func (s *Server) envFor(app api.App) (map[string]string, error) {
+	if app.EnvResolved {
+		return app.ReleaseEnv, nil
+	}
+	return s.resolveEnv(app)
+}
+
+func (s *Server) resolveEnv(app api.App) (map[string]string, error) {
 	env := map[string]string{}
 	for k, v := range app.Env {
 		env[k] = v
@@ -302,63 +317,12 @@ func (s *Server) syncProxyLocked() {
 	}
 	asgs, _ := s.Store.ListAssignments()
 	nodes, _ := s.Store.ListNodes()
+	names := map[string]bool{}
 	for _, r := range routes {
-		_ = s.proxy.Set(r.Name, r.Port, routeBackend(r, asgs, nodes))
+		names[r.Name] = true
+		_ = s.proxy.SetBackends(r.Name, r.Port, proxy.Backends(r, asgs, nodes))
 	}
-}
-
-func routeBackend(r api.Route, asgs []api.Assignment, nodes []api.Node) string {
-	byNode := map[string]api.Node{}
-	for _, n := range nodes {
-		byNode[n.ID] = n
-	}
-	var best api.Assignment
-	found := false
-	for _, asg := range asgs {
-		if asg.App != r.App || asg.Status != api.StatusRunning {
-			continue
-		}
-		port := asg.HostPort
-		if port == 0 {
-			port = r.TargetPort
-		}
-		if port == 0 {
-			continue
-		}
-		asg.HostPort = port
-		if !found || routePrefer(asg, best) {
-			best = asg
-			found = true
-		}
-	}
-	if !found {
-		return ""
-	}
-	host := "127.0.0.1"
-	if n, ok := byNode[best.NodeID]; ok {
-		host = hostOnly(n.Addr)
-	}
-	return net.JoinHostPort(host, strconv.Itoa(best.HostPort))
-}
-
-func routePrefer(a, b api.Assignment) bool {
-	if a.Replaces != "" && b.Replaces == "" {
-		return true
-	}
-	if a.Replaces == "" && b.Replaces != "" {
-		return false
-	}
-	return a.Updated.After(b.Updated)
-}
-
-func hostOnly(addr string) string {
-	if addr == "" {
-		return "127.0.0.1"
-	}
-	if h, _, err := net.SplitHostPort(addr); err == nil && h != "" {
-		return h
-	}
-	return addr
+	s.proxy.RemoveExcept(names)
 }
 
 func (s *Server) recordLocked(now time.Time, kind, target, reason, result string) error {
@@ -375,15 +339,6 @@ func (s *Server) notifyLocked() {
 		}
 	}
 	s.waiters = nil
-}
-
-func hasPlacement(asgs []api.Assignment, p schedule.Placement) bool {
-	for _, a := range asgs {
-		if a.App == p.App && a.NodeID == p.NodeID && a.Generation == p.Generation && a.Replaces == p.Replaces && api.Active(a.Status) {
-			return true
-		}
-	}
-	return false
 }
 
 func jsonMarshal(v any) ([]byte, error) {

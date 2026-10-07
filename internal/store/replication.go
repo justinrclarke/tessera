@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"strconv"
 	"strings"
+	"time"
 )
 
 type Statement struct {
@@ -21,6 +22,21 @@ type Batch struct {
 }
 
 var ErrStaleBatch = errors.New("replicated command was prepared against an older state")
+
+func (s *Store) PruneReceipts(now time.Time) error {
+	last, err := s.Meta("receipts_pruned_at")
+	if err != nil {
+		return err
+	}
+	n, _ := strconv.ParseInt(last, 10, 64)
+	if last != "" && now.Unix()-n < 60 {
+		return nil
+	}
+	if _, err := s.exec(`DELETE FROM meta WHERE key LIKE 'request:%' AND json_extract(value, '$.expires') <= ?`, now.Unix()); err != nil {
+		return err
+	}
+	return s.SetMeta("receipts_pruned_at", strconv.FormatInt(now.Unix(), 10))
+}
 
 func (s *Store) Capture(fn func(*Store) error) (Batch, error) {
 	tx, err := s.db.Begin()

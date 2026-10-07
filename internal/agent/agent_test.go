@@ -5,10 +5,14 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
+	"net"
 	"net/http"
 	"net/http/httptest"
 	"os"
 	"path/filepath"
+	"strconv"
+	"strings"
 	"testing"
 	"time"
 
@@ -197,5 +201,105 @@ func TestWipeKeepsStateWhenStopFails(t *testing.T) {
 	}
 	if _, err := os.Stat(filepath.Join(dir, "cache.json")); err != nil {
 		t.Fatalf("removed cache after failed stop: %v", err)
+	}
+}
+
+func TestCorruptCacheCannotStartAgentWithFreshIdentity(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "cache.json")
+	body := []byte(`{"epoch":`)
+	if err := os.WriteFile(path, body, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	ag := &Agent{DataDir: dir, Runtime: runtime.NewFake()}
+	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+	defer cancel()
+	if err := ag.Run(ctx); err == nil || errors.Is(err, context.DeadlineExceeded) {
+		t.Fatalf("agent ignored corrupt fencing state: %v", err)
+	}
+	saved, err := os.ReadFile(path)
+	if err != nil || string(saved) != string(body) {
+		t.Fatalf("agent replaced corrupt cache: %s %v", saved, err)
+	}
+}
+
+type exitedOnStart struct{ *runtime.Fake }
+
+func (r exitedOnStart) Start(ctx context.Context, spec runtime.Spec) (runtime.Container, error) {
+	c, err := r.Fake.Start(ctx, spec)
+	r.Fake.Kill(c.ID, "crash", false)
+	c.Running = false
+	return c, err
+}
+
+func TestImmediateExitCannotMarkReleaseHealthy(t *testing.T) {
+	for _, kind := range []string{api.KindApp, api.KindJob} {
+		t.Run(kind, func(t *testing.T) {
+			var reports []client.StatusReport
+			srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				if r.URL.Path != "/v1/assignments/fast-exit/status" {
+					http.NotFound(w, r)
+					return
+				}
+				var report client.StatusReport
+				if err := json.NewDecoder(r.Body).Decode(&report); err != nil {
+					t.Error(err)
+				}
+				reports = append(reports, report)
+				_, _ = w.Write([]byte(`{}`))
+			}))
+			defer srv.Close()
+			ag := &Agent{DataDir: t.TempDir(), Runtime: exitedOnStart{runtime.NewFake()}, Client: client.New(srv.URL, "token")}
+			if err := ag.ConvergeForTest(context.Background(), []api.Assignment{{ID: "fast-exit", Image: "image", Kind: kind, Status: api.StatusPending}}, true); err != nil {
+				t.Fatal(err)
+			}
+			want := api.StatusFailed
+			if kind == api.KindJob {
+				want = api.StatusSucceeded
+			}
+			if len(reports) != 1 || reports[0].Status != want {
+				t.Fatalf("exited process marked healthy: %+v", reports)
+			}
+		})
+	}
+}
+
+func TestStartupTimeoutSurvivesAgentRestart(t *testing.T) {
+	probe := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) { w.WriteHeader(http.StatusServiceUnavailable) }))
+	defer probe.Close()
+	_, portText, _ := net.SplitHostPort(probe.Listener.Addr().String())
+	port, _ := strconv.Atoi(portText)
+	var reports []client.StatusReport
+	control := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if strings.HasSuffix(r.URL.Path, "/status") {
+			var report client.StatusReport
+			json.NewDecoder(r.Body).Decode(&report)
+			reports = append(reports, report)
+		}
+		io.WriteString(w, "{}")
+	}))
+	defer control.Close()
+	rtm := runtime.NewFake()
+	dir := t.TempDir()
+	now := time.Now()
+	asg := api.Assignment{ID: "slow", Status: api.StatusPending, Image: "slow", Health: &api.Health{Path: "/ready", Port: 80, StartupTimeout: "5s"}, Ports: []api.Port{{Container: 80, Host: port}}}
+	a := &Agent{DataDir: dir, Runtime: rtm, Client: client.New(control.URL, "token"), Now: func() time.Time { return now }}
+	if err := a.ConvergeForTest(context.Background(), []api.Assignment{asg}, true); err != nil {
+		t.Fatal(err)
+	}
+	if len(reports) != 1 || reports[0].Status != api.StatusStarting {
+		t.Fatalf("unready process marked running: %+v", reports)
+	}
+	now = now.Add(6 * time.Second)
+	restarted := &Agent{DataDir: dir, Runtime: rtm, Client: a.Client, Now: func() time.Time { return now }}
+	if err := restarted.restore(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	if reports[len(reports)-1].Status != api.StatusFailed || !strings.Contains(reports[len(reports)-1].Reason, "startup timeout") {
+		t.Fatalf("restart reset startup deadline: %+v", reports)
+	}
+	items, _ := rtm.List(context.Background())
+	if len(items) != 0 {
+		t.Fatalf("timed-out process kept running: %+v", items)
 	}
 }

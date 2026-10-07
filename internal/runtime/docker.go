@@ -88,8 +88,8 @@ func (d *Docker) Start(ctx context.Context, spec Spec) (Container, error) {
 	}
 	c := Container{ID: created.ID, Name: spec.Name, Running: true}
 	if inspected, err := d.inspect(ctx, created.ID); err == nil {
-		c.HostPort = inspected.HostPort
-		c.Running = inspected.Running
+		c = inspected
+		c.Name = spec.Name
 	}
 	return c, nil
 }
@@ -133,8 +133,12 @@ func (d *Docker) List(ctx context.Context) ([]Container, error) {
 			c.HostPort = it.Ports[0].PublicPort
 		}
 		if !c.Running {
-			c.ExitCode = 1
-			c.Reason = it.State
+			inspected, err := d.inspect(ctx, it.ID)
+			if err != nil {
+				return nil, fmt.Errorf("inspect %s: %w", name, err)
+			}
+			inspected.Name = name
+			c = inspected
 		}
 		out = append(out, c)
 	}

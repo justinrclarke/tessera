@@ -9,6 +9,7 @@ import (
 	"io"
 	"net"
 	"net/http"
+	"os"
 	"path/filepath"
 	"reflect"
 	"strings"
@@ -289,6 +290,39 @@ func TestReplicatedWritesRedirectAndSurviveLeaderLoss(t *testing.T) {
 			continue
 		}
 		waitReplica(t, func() bool { a, err := srv.Store.GetApp("web"); return err == nil && a.Generation == 2 })
+	}
+}
+
+func TestControllerStatusRemainsLocalAndAuthenticatedWithoutMajority(t *testing.T) {
+	c := newReplicaTestCluster(t)
+	leader := c.leader(t, -1)
+	for i, peer := range c.peers {
+		cl := client.New(peer.URL, "replica-token")
+		status, err := cl.ControllerStatus(context.Background())
+		if err != nil || status.ID != peer.ID || status.Writable != (i == leader) || status.Epoch == 0 {
+			t.Fatalf("controller status redirected or wrong: %+v %v", status, err)
+		}
+		if _, err := client.New(peer.URL, "wrong").ControllerStatus(context.Background()); err == nil {
+			t.Fatal("controller state exposed without authentication")
+		}
+	}
+	c.transports[leader].DisconnectAll()
+	for i, transport := range c.transports {
+		if i != leader {
+			transport.Disconnect(c.transports[leader].LocalAddr())
+		}
+	}
+	c.leader(t, leader)
+	cl := client.New(c.peers[leader].URL, "replica-token")
+	status, err := cl.ControllerStatus(context.Background())
+	if err != nil || status.ID != c.peers[leader].ID || status.Writable {
+		t.Fatalf("minority status unavailable or writable: %+v %v", status, err)
+	}
+	for _, dir := range c.dirs {
+		info, err := os.Stat(filepath.Join(dir, "raft-snapshots"))
+		if err != nil || info.Mode().Perm() != 0o700 {
+			t.Fatalf("Raft snapshots expose secrets: %v %v", info, err)
+		}
 	}
 }
 

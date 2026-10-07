@@ -16,9 +16,11 @@ import (
 	"net"
 	"net/http"
 	"net/url"
+	"os"
 	"path/filepath"
 	"sort"
 	"strconv"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -129,7 +131,14 @@ func (s *Server) startReplication(cfg ReplicaConfig) error {
 	if err != nil {
 		return err
 	}
-	snapshots, err := raft.NewFileSnapshotStore(filepath.Join(s.DataDir, "raft-snapshots"), 2, io.Discard)
+	snapshotDir := filepath.Join(s.DataDir, "raft-snapshots")
+	if err := os.MkdirAll(snapshotDir, 0o700); err != nil {
+		return err
+	}
+	if err := os.Chmod(snapshotDir, 0o700); err != nil {
+		return err
+	}
+	snapshots, err := raft.NewFileSnapshotStore(snapshotDir, 2, io.Discard)
 	if err != nil {
 		return err
 	}
@@ -349,7 +358,7 @@ func (s *Server) replicatedHandler(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		urls, _ := json.Marshal(s.controllerURLs())
 		w.Header().Set("X-Tessera-Controllers", string(urls))
-		if r.URL.Path == "/v1/health" || r.URL.Path == "/v1/leader" {
+		if r.URL.Path == "/v1/health" || r.URL.Path == "/v1/leader" || r.URL.Path == "/v1/controllers" {
 			next.ServeHTTP(w, r)
 			return
 		}
@@ -376,7 +385,15 @@ func (s *Server) replicatedHandler(next http.Handler) http.Handler {
 		}
 		response := &replicaResponse{Headers: make(http.Header)}
 		err := s.propose(r.Context(), s.now(), func(worker *Server) error {
+			if err := worker.Store.PruneReceipts(worker.now()); err != nil {
+				return err
+			}
 			if requestID != "" {
+				retention := 24 * time.Hour
+				if r.URL.Path == "/v1/nodes/register" || strings.HasSuffix(r.URL.Path, "/heartbeat") || strings.HasSuffix(r.URL.Path, "/status") {
+					retention = 2 * time.Minute
+				}
+				response.Expires = worker.now().Add(retention).Unix()
 				cached, err := worker.Store.Meta("request:" + requestID)
 				if err != nil {
 					return err
@@ -420,6 +437,7 @@ type replicaResponse struct {
 	Headers http.Header `json:"headers"`
 	Code    int         `json:"code"`
 	Body    []byte      `json:"body"`
+	Expires int64       `json:"expires,omitempty"`
 }
 
 func (r *replicaResponse) Header() http.Header  { return r.Headers }

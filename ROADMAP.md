@@ -15,6 +15,20 @@ Dependencies stay on the known set. Do not add an unknown module to get a featur
 
 A new direct module is a roadmap change, not a pull request convenience.
 
+## Trial and reliability gates
+
+The 0.4.0 review found that consensus alone is not enough for a reliable trial. Keep these gates ahead of broader compatibility claims, alongside the version milestones below:
+
+- Controller failure: prove abrupt process loss, minority write refusal, catch-up, full restart, and offline restore. Run the same workload on three physical machines, measure recovery time, and verify that containers and assignment identities remain unchanged. The local TCP/TLS process test covers abrupt leader and quorum loss; the physical-machine drill remains open.
+- Reachable workloads: exercise real HTTP traffic during controller and node failure through one stable client address. Routes now balance TCP connections across ready backends. The independent gateway keeps one client address through controller elections and quorum loss in the local three-process HTTP test. Controller listeners still have separate addresses, and gateway-host failover, cross-machine connectivity, and in-flight connection draining remain open. Registry access or an explicit image distribution plan must survive controller loss; local cache files are not replicated. A fixed Route port alone does not satisfy this gate.
+- Safe updates: HTTP readiness, startup deadlines, serial App replacements, and immutable Config/Secret environment rollback are implemented. The default HTTP drill preserves the old service through slow startup and an invalid image. A disposable Docker drill verifies actual ready cutover and failed-command rollback on OrbStack. Without a health check, `running` still means only that the process runs. Fixed host ports require spare nodes; containerd host-network port placement, connection draining, multi-machine rollout, and sustained traffic under rolling updates still need acceptance. Jobs retain cancel-and-replace generation updates.
+- Honest migration and data ownership: never import only part of a workload without reporting it. Workloads needing storage, sidecars, init containers, probes, security context, or environment references are now skipped. Namespace collisions, Service selector mapping, multiple target ports, DaemonSet placement, and Job completions versus parallelism need acceptance before broad Kubernetes conversion claims. Persistent volumes, stable stateful identity, backup of application data, and prevention of duplicate stateful writers remain unimplemented. Use disposable stateless workloads for trials.
+- Installation and upgrades: verify the actual macOS user service and a native Linux systemd user service, including reboot, log access, binary replacement, and recovery after failure. Specify controller service installation, rolling binary upgrades, supported version skew, schema compatibility, and rollback before promising unattended operation. User services currently follow the user's login lifecycle.
+- Trust and capacity: the shared token grants full cluster access, including Secrets and destructive confirmations. Raft traffic uses mutual TLS, while the HTTP API needs a trusted LAN or an authenticated HTTPS endpoint; per-node authorization and token rotation remain open. Credential files, database backups, and snapshot directories are now private. Bound request receipts, measure heartbeat and commit latency under load, and address action, assignment, and snapshot retention plus disk exhaustion before publishing cluster-size limits.
+- A useful first run: document a downloadable binary path, a copyable App and Route, expected results, controller diagnostics, cleanup, and what is unsupported. Keep one agent per Docker daemon until workload ownership and duplicate-agent fencing are enforced. Add a CLI path to propose removal and inspect its confirmation; `ask` currently only explains and cannot propose actions. `ask` also needs explicit explanations for unplaced Apps, missing configuration, exhausted capacity, and label or GPU mismatches. Invalid or unimplemented manifest settings must fail clearly rather than being accepted without effect.
+
+These are acceptance requirements, not claims that every feature is implemented. The 0.4.0 release supports stateless evaluation on the verified local path. General cross-machine deployment still requires evidence for the controller, network, and installation gates.
+
 ## 0.1.0
 
 Shipped. One binary, SQLite, LAN join, placement, make-before-break moves, playbook healing, snapshot promotion, read-only MCP, and Kubernetes manifest import.
@@ -63,6 +77,8 @@ Custom resource instances and operator behavior remain outside the conversion bo
 
 ## 0.4.0
 
+Released 2026-10-06 for the locally verified stateless evaluation path. The broader deployment gates above remain open.
+
 The controller is cattle, including when you meant to run more than one. Snapshot promotion already covers a dead leader. This is the step after that, not before the daily path works.
 
 Three-controller replication is implemented and locally verified with `github.com/hashicorp/raft`. Each controller keeps its command log, election state, and resource state through the existing single SQLite connection. Mutations require a majority; followers direct clients to the elected leader. Elections advance the committed epoch and preserve running assignment identities. Agents remember all three addresses, reconnect, and keep their highest observed epoch across restarts. Agents in a replica cluster do not promote themselves outside consensus.
@@ -74,6 +90,8 @@ The offline recovery path also accepts a replica backup: `tessera restore` valid
 - `tessera backup` restores that store onto a new leader.
 
 The acceptance drill starts three controllers, loses the leader's response during an App update, retries the same request through an election, and verifies one committed generation and an unchanged workload with no restart. It restarts the old leader, checks catch-up, isolates it, rejects its write, and restores a replica backup after stopping the cluster. Controller tests also cover every mutation endpoint on a minority, exact signed snapshot bytes, authenticated TLS replication, and recovery from both a snapshot and later log entries after a full restart. Race checks pass for the controller, agent, store, client, and drill packages.
+
+The 0.4.0 release adds authenticated per-controller status, atomic fencing-state persistence, private database and backup files, bounded retry receipts, and safe retry of a truncated response body. It also repairs registration clearing cordons, terminal assignment resurrection, collapsed same-node replicas, and repeated completed Job workers. A separate test runs three CLI controller processes over TCP/TLS, kills processes abruptly, loses quorum, and recovers from the existing store without restarting the workload or interrupting HTTP requests at an independent gateway. HTTP readiness, startup timeout persistence, serial make-before-break App updates, and Config/Secret environment rollback are now implemented. Real Docker smoke tests verify successful Job exit status, slow startup, ready cutover, and failed-command rollback. See the trial and reliability gates above for the remaining acceptance requirements.
 
 Membership is a fixed set of three stable IDs and addresses. New clusters require empty stores; changing membership or converting a populated standalone controller into a replica cluster is not implemented. Image cache files stay local and are not replicated. Acceptance across three physical machines remains open.
 

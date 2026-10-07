@@ -27,3 +27,36 @@ func TestGangFabricRequiresGangJob(t *testing.T) {
 		t.Fatal("accepted fabric requirement on an App")
 	}
 }
+
+func TestManifestRejectsIgnoredSettingsAndAllowsScaleToZero(t *testing.T) {
+	base := "kind: App\nname: web\nimage: nginx\n"
+	for _, field := range []string{"repilcas: 2\n", "health: {path: /ready, port: 80}\n", "volumes: []\n", "replicas: -1\n", "resources: {memroy: 128Mi}\n", "resources: {cpu: -100m}\n", "ports: [{container: 80, protocol: UDP}]\n"} {
+		if _, err := DecodeOne([]byte(base + field)); err == nil {
+			t.Fatalf("silently accepted invalid or unimplemented setting: %s", field)
+		}
+	}
+	for _, tc := range []struct {
+		field    string
+		replicas int
+	}{{"", 1}, {"replicas: 0\n", 0}, {"replicas: 2\n", 2}} {
+		obj, err := DecodeOne([]byte(base + tc.field))
+		if err != nil || obj.App.Replicas != tc.replicas {
+			t.Fatalf("replica setting %q: %+v %v", tc.field, obj.App, err)
+		}
+	}
+	if _, err := DecodeOne([]byte("kind: Policy\nmove: {min_gain: 0.2, cooldown: 5m}\n")); err != nil {
+		t.Fatalf("valid nested move policy rejected: %v", err)
+	}
+}
+
+func TestHTTPReadinessManifest(t *testing.T) {
+	base := "kind: App\nname: web\nimage: nginx\nports: [{container: 80}]\n"
+	if _, err := DecodeOne([]byte(base + "health: {path: /ready, port: 80, timeout: 500ms, startup_timeout: 30s}\n")); err != nil {
+		t.Fatal(err)
+	}
+	for _, health := range []string{"{path: //other/ready, port: 80}", "{path: /ready, port: 90}", "{path: /ready, port: 80, timeout: -1s}", "{path: /ready, port: 80, startup_timeout: never}"} {
+		if _, err := DecodeOne([]byte(base + "health: " + health)); err == nil {
+			t.Fatalf("accepted invalid readiness: %s", health)
+		}
+	}
+}

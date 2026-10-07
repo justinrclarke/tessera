@@ -172,6 +172,48 @@ func TestMoveCompletesWhenReplacementRuns(t *testing.T) {
 	if len(got.Stop) != 1 || got.Stop[0] != "old" {
 		t.Fatalf("%+v", got)
 	}
+	if len(got.Place) != 0 {
+		t.Fatalf("completed replacement caused another replica: %+v", got)
+	}
+}
+
+func TestSettledReplacementCanMoveAgainAfterCooldown(t *testing.T) {
+	a := app("web", 1)
+	in := Input{
+		Apps: []api.App{a}, Nodes: []api.Node{node("fast", api.NodeReady, 2, 4000), node("faster", api.NodeReady, 5, 4000)},
+		Assignments: []api.Assignment{
+			{ID: "old", App: "web", NodeID: "slow", Generation: 1, Status: api.StatusStopped},
+			{ID: "settled", App: "web", NodeID: "fast", Generation: 1, Status: api.StatusRunning, Replaces: "old"},
+		},
+		AllowMove: true, Cooldown: time.Minute, Now: time.Unix(100, 0), LastMove: map[string]time.Time{"web": time.Unix(1, 0)},
+	}
+	got := Plan(in)
+	if len(got.Place) != 1 || got.Place[0].Replaces != "settled" || got.Place[0].NodeID != "faster" || len(got.Stop) != 0 {
+		t.Fatalf("settled move created a replica or could not move again: %+v", got)
+	}
+	if got := Plan(Input{Apps: in.Apps, Nodes: in.Nodes, Assignments: in.Assignments}); len(got.Place) != 0 || len(got.Stop) != 0 {
+		t.Fatalf("settled replacement was not stable: %+v", got)
+	}
+}
+
+func TestScalingStopsSettledAndPendingMoves(t *testing.T) {
+	a := app("web", 1)
+	in := Input{
+		Apps: []api.App{a}, Nodes: []api.Node{node("a", api.NodeReady, 1, 4000)},
+		Assignments: []api.Assignment{
+			{ID: "one", App: "web", NodeID: "a", Generation: 1, Status: api.StatusRunning, Replaces: "gone-one"},
+			{ID: "two", App: "web", NodeID: "a", Generation: 1, Status: api.StatusRunning, Replaces: "gone-two"},
+		},
+	}
+	if got := Plan(in); len(got.Stop) != 1 || len(got.Place) != 0 {
+		t.Fatalf("settled moves prevented scale-down: %+v", got)
+	}
+	in.Apps[0].Replicas = 0
+	in.Assignments[1].Replaces = "one"
+	in.Assignments[1].Status = api.StatusPending
+	if got := Plan(in); len(got.Stop) != 2 || len(got.Place) != 0 {
+		t.Fatalf("pending move prevented scale-to-zero: %+v", got)
+	}
 }
 
 func TestCooldownBlocksMove(t *testing.T) {
@@ -243,6 +285,23 @@ func TestRunningJobDoesNotMoveWithoutCheckpoint(t *testing.T) {
 	}
 }
 
+func TestCompletedJobWorkersCountTowardReplicas(t *testing.T) {
+	a := app("batch", 3)
+	a.Kind = api.KindJob
+	in := Input{
+		Apps: []api.App{a}, Nodes: []api.Node{node("a", api.NodeReady, 1, 4000)},
+		Assignments: []api.Assignment{
+			{ID: "done", App: a.Name, NodeID: "a", Generation: 1, Status: api.StatusSucceeded},
+			{ID: "working", App: a.Name, NodeID: "a", Generation: 1, Status: api.StatusRunning},
+			{ID: "old", App: a.Name, NodeID: "a", Generation: 0, Status: api.StatusSucceeded},
+		},
+	}
+	got := Plan(in)
+	if len(got.Place) != 1 || len(got.Stop) != 0 {
+		t.Fatalf("completed worker was replaced: %+v", got)
+	}
+}
+
 func TestDependencyHold(t *testing.T) {
 	web := app("web", 1)
 	web.DependsOn = []string{"db"}
@@ -264,5 +323,65 @@ func TestFailedOverMaxRestartsReplaced(t *testing.T) {
 	got := Plan(in)
 	if len(got.Stop) != 1 || len(got.Place) != 1 {
 		t.Fatalf("%+v", got)
+	}
+}
+
+func TestRolloutWaitsForReadinessAndCapacity(t *testing.T) {
+	a := app("web", 1)
+	a.Generation = 2
+	old := api.Assignment{ID: "old", App: "web", NodeID: "a", Generation: 1, Status: api.StatusRunning, Resources: a.Resources}
+	in := Input{Apps: []api.App{a}, Nodes: []api.Node{node("a", api.NodeReady, 1, 4000)}, Assignments: []api.Assignment{old}, AllowMove: true}
+	plan := Plan(in)
+	if len(plan.Stop) != 0 || len(plan.Place) != 1 || plan.Place[0].Replaces != "old" || plan.Place[0].Generation != 2 {
+		t.Fatalf("unsafe rollout: %+v", plan)
+	}
+	in.Assignments = append(in.Assignments, api.Assignment{ID: "new", App: "web", NodeID: "a", Generation: 2, Replaces: "old", Status: api.StatusStarting})
+	if plan = Plan(in); len(plan.Stop) != 0 || len(plan.Place) != 0 {
+		t.Fatalf("unready replacement displaced old work: %+v", plan)
+	}
+	in.Assignments[1].Status = api.StatusRunning
+	if plan = Plan(in); len(plan.Stop) != 1 || plan.Stop[0] != "old" || len(plan.Place) != 0 {
+		t.Fatalf("ready replacement did not cut over: %+v", plan)
+	}
+	in.Assignments[0].Status = api.StatusStarting
+	in.Assignments[1].Status = api.StatusStarting
+	if plan = Plan(in); len(plan.Stop) != 0 || len(plan.Place) != 0 {
+		t.Fatalf("transient readiness loss stopped old process before replacement readiness: %+v", plan)
+	}
+	in.Assignments = []api.Assignment{old}
+	in.Nodes[0].Capacity.CPU = a.Resources.CPU
+	if plan = Plan(in); len(plan.Stop) != 0 || len(plan.Place) != 0 {
+		t.Fatalf("capacity shortage stopped healthy work: %+v", plan)
+	}
+}
+
+func TestFixedPortsRequireAnotherNodeForRollout(t *testing.T) {
+	a := app("web", 1)
+	a.Generation = 2
+	a.Ports = []api.Port{{Container: 80, Host: 8080}}
+	in := Input{Apps: []api.App{a}, Nodes: []api.Node{node("a", api.NodeReady, 1, 4000)}, Assignments: []api.Assignment{{ID: "old", App: "web", NodeID: "a", Generation: 1, Status: api.StatusRunning, Ports: a.Ports}}}
+	if plan := Plan(in); len(plan.Place) != 0 || len(plan.Stop) != 0 {
+		t.Fatalf("overlapped fixed host port: %+v", plan)
+	}
+	in.Nodes = append(in.Nodes, node("b", api.NodeReady, 1, 4000))
+	if plan := Plan(in); len(plan.Place) != 1 || plan.Place[0].NodeID != "b" || len(plan.Stop) != 0 {
+		t.Fatalf("did not roll out on spare node: %+v", plan)
+	}
+}
+
+func TestRolloutSurgesOneReplicaAtATime(t *testing.T) {
+	a := app("web", 3)
+	a.Generation = 2
+	in := Input{Apps: []api.App{a}, Nodes: []api.Node{node("a", api.NodeReady, 1, 4000)}}
+	for _, id := range []string{"one", "two", "three"} {
+		in.Assignments = append(in.Assignments, api.Assignment{ID: id, App: "web", NodeID: "a", Generation: 1, Status: api.StatusRunning})
+	}
+	plan := Plan(in)
+	if len(plan.Place) != 1 || len(plan.Stop) != 0 {
+		t.Fatalf("rollout did not limit surge: %+v", plan)
+	}
+	in.Assignments = append(in.Assignments, api.Assignment{ID: "new", App: "web", NodeID: "a", Generation: 2, Status: api.StatusStarting, Replaces: plan.Place[0].Replaces})
+	if plan = Plan(in); len(plan.Place) != 0 || len(plan.Stop) != 0 {
+		t.Fatalf("surged while replacement was unready: %+v", plan)
 	}
 }
