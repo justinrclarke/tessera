@@ -8,7 +8,7 @@ What is coming next is in [ROADMAP.md](ROADMAP.md).
 
 ## Run
 
-Published binaries are available for each OS and architecture from the [latest release](https://github.com/justinrclarke/tessera/releases/latest), with SHA-256 checksums. The unreleased 0.4.0 commands and fixes described here require building this branch:
+Published 0.4.0 binaries are available for macOS and Linux, amd64 and arm64, from the [latest release](https://github.com/justinrclarke/tessera/releases/latest), with SHA-256 checksums. Download the archive for your platform, extract it, and run `./tessera version`. To build from source instead:
 
 ```
 go build -o tessera ./cmd/tessera

@@ -1,6 +1,8 @@
 # Changelog
 
-## 0.4.0 (unreleased)
+## 0.4.0 (2026-10-06)
+
+Controller reliability, HTTP readiness, safe App updates, and an independent service gateway. Verified locally with three controller processes and Docker on OrbStack. Cross-machine acceptance, connection draining, gateway-host failover, and live service-manager upgrades remain open.
 
 - Apps support HTTP readiness and bounded startup, with probe state preserved across agent restart. Routes exclude unready replicas; later readiness failure removes a replica from routing without restarting its process.
 - App updates replace one assignment at a time and retain the previous service until its replacement is ready. Ports, resources, health, dependencies, and referenced Config/Secret data participate in release changes. Resolved environment values survive rollback; all desired replicas must become ready before a generation is marked healthy. Failed apply is atomic, and failed generations cannot reuse release numbers or suppress later rollback.
