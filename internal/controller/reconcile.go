@@ -3,6 +3,7 @@ package controller
 import (
 	"context"
 	"fmt"
+	"maps"
 	"strconv"
 	"time"
 
@@ -114,7 +115,16 @@ func (s *Server) healLocked(now time.Time, pol api.Policy) error {
 func (s *Server) executeLocked(f diagnose.Finding, now time.Time) error {
 	switch f.Action {
 	case "rollback":
-		_, err := s.Store.Rollback(f.Target)
+		assignments, err := s.Store.ListAssignments()
+		if err != nil {
+			return err
+		}
+		for _, assignment := range assignments {
+			if assignment.App == f.Target && assignment.Storage != nil && api.Active(assignment.Status) {
+				return fmt.Errorf("persistent app rollback requires scaling to zero and waiting for stop acknowledgement")
+			}
+		}
+		_, err = s.Store.Rollback(f.Target)
 		return err
 	case "cordon":
 		n, err := s.Store.GetNode(f.Target)
@@ -144,7 +154,16 @@ func (s *Server) scheduleLocked(now time.Time, pol api.Policy) error {
 	if err != nil {
 		return err
 	}
+	pinned, err := s.checkpointMoves(apps, nodes, asgs, pol, now)
+	if err != nil {
+		return err
+	}
+	asgs, err = s.Store.ListAssignments()
+	if err != nil {
+		return err
+	}
 	plan := schedule.Plan(schedule.Input{
+		Pinned:      pinned,
 		Apps:        apps,
 		Nodes:       nodes,
 		Assignments: asgs,
@@ -164,7 +183,18 @@ func (s *Server) scheduleLocked(now time.Time, pol api.Policy) error {
 		if asg.Status == api.StatusStopped {
 			continue
 		}
-		asg.Status = api.StatusStopped
+		if asg.Status == api.StatusDraining && now.Before(asg.StopAfter) {
+			continue
+		}
+		if asg.Storage != nil {
+			asg.Status = api.StatusStopping
+		} else if app, err := s.Store.GetApp(asg.App); err == nil && app.DrainTimeout != "" && asg.Status == api.StatusRunning {
+			duration, _ := time.ParseDuration(app.DrainTimeout)
+			asg.Status = api.StatusDraining
+			asg.StopAfter = now.Add(duration + 2*time.Second)
+		} else {
+			asg.Status = api.StatusStopped
+		}
 		asg.Updated = now
 		if err := s.Store.PutAssignment(asg); err != nil {
 			return err
@@ -212,7 +242,8 @@ func (s *Server) assignmentFrom(p schedule.Placement, now time.Time) (api.Assign
 	if err != nil {
 		return api.Assignment{}, err
 	}
-	return api.Assignment{
+	asg := api.Assignment{
+		Storage:    app.Storage,
 		ID:         api.NewID(),
 		App:        app.Name,
 		NodeID:     p.NodeID,
@@ -230,12 +261,27 @@ func (s *Server) assignmentFrom(p schedule.Placement, now time.Time) (api.Assign
 		Kind:       app.Kind,
 		Health:     app.Health,
 		Updated:    now,
-	}, nil
+	}
+	if app.Storage != nil {
+		if asg.Env == nil {
+			asg.Env = map[string]string{}
+		}
+		asg.Env["TESSERA_WORKLOAD_ID"] = app.Name
+	}
+	if app.Checkpoint != nil {
+		asg.CheckpointDirectory = app.Checkpoint.Directory
+		if asg.Env == nil {
+			asg.Env = map[string]string{}
+		}
+		asg.Env["TESSERA_CHECKPOINT_DIRECTORY"], asg.Env["TESSERA_ASSIGNMENT_ID"] = app.Checkpoint.Directory, asg.ID
+		asg.Env["TESSERA_WORKER_RANK"] = strconv.Itoa(p.Rank)
+	}
+	return asg, nil
 }
 
 func (s *Server) envFor(app api.App) (map[string]string, error) {
 	if app.EnvResolved {
-		return app.ReleaseEnv, nil
+		return maps.Clone(app.ReleaseEnv), nil
 	}
 	return s.resolveEnv(app)
 }
@@ -273,6 +319,11 @@ func (s *Server) writeSnapshotLocked(now time.Time) error {
 	v, _ := s.Store.Meta("snapshot_index")
 	idx, _ := strconv.ParseUint(v, 10, 64)
 	idx++
+	if idx%128 == 0 {
+		if err := s.Store.PruneHistory(); err != nil {
+			return err
+		}
+	}
 	apps, err := s.Store.ListApps()
 	if err != nil {
 		return err
@@ -292,9 +343,30 @@ func (s *Server) writeSnapshotLocked(now time.Time) error {
 		return err
 	}
 	snap := api.Snapshot{
-		Index: idx, Epoch: s.epoch, LeaderID: s.ID, Taken: now,
+		FormatVersion: api.StateVersion,
+		Index:         idx, Epoch: s.epoch, LeaderID: s.ID, Taken: now,
 		Apps: apps, Assignments: asgs, Policy: pol, Routes: routes, Configs: cfgs, Secrets: secs,
 		Controllers: s.controllerURLs(),
+	}
+	snap.Infrastructure, err = s.Store.MetaPrefix("infra:")
+	if err != nil {
+		return err
+	}
+	snap.Security, err = s.Store.MetaPrefix("auth:")
+	if err != nil {
+		return err
+	}
+	for _, app := range apps {
+		move, err := s.Store.Meta("checkpoint:" + app.Name)
+		if err != nil {
+			return err
+		}
+		if move != "" {
+			if snap.CheckpointMoves == nil {
+				snap.CheckpointMoves = map[string]string{}
+			}
+			snap.CheckpointMoves[app.Name] = move
+		}
 	}
 	raw, err := jsonMarshal(snap)
 	if err != nil {
@@ -320,7 +392,11 @@ func (s *Server) syncProxyLocked() {
 	names := map[string]bool{}
 	for _, r := range routes {
 		names[r.Name] = true
-		_ = s.proxy.SetBackends(r.Name, r.Port, proxy.Backends(r, asgs, nodes))
+		drain := time.Duration(0)
+		if app, err := s.Store.GetApp(r.App); err == nil {
+			drain, _ = time.ParseDuration(app.DrainTimeout)
+		}
+		_ = s.proxy.SetBackendsWithDrain(r.Name, r.Port, proxy.Backends(r, asgs, nodes), drain)
 	}
 	s.proxy.RemoveExcept(names)
 }

@@ -383,6 +383,9 @@ func (s *Server) replicatedHandler(next http.Handler) http.Handler {
 			http.Error(w, "request ID too long", http.StatusBadRequest)
 			return
 		}
+		if requestID != "" {
+			requestID = tokenHash(r.Header.Get("Authorization") + "\x00" + r.Method + "\x00" + r.URL.Path + "\x00" + requestID)
+		}
 		response := &replicaResponse{Headers: make(http.Header)}
 		err := s.propose(r.Context(), s.now(), func(worker *Server) error {
 			if err := worker.Store.PruneReceipts(worker.now()); err != nil {

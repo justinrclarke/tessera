@@ -10,6 +10,7 @@ import (
 	"net"
 	"net/http"
 	"net/url"
+	"os"
 	"strings"
 )
 
@@ -31,6 +32,9 @@ func NewDocker(sock string) *Docker {
 }
 
 func (d *Docker) Start(ctx context.Context, spec Spec) (Container, error) {
+	if err := validateStorage(spec.Storage); err != nil {
+		return Container{}, &StartError{Reason: err.Error()}
+	}
 	if err := d.pull(ctx, spec.Image); err != nil {
 		return Container{}, &StartError{Reason: "pull: " + err.Error()}
 	}
@@ -38,6 +42,12 @@ func (d *Docker) Start(ctx context.Context, spec Spec) (Container, error) {
 		"Image": spec.Image,
 		"Env":   envList(spec.Env),
 		"Cmd":   spec.Command,
+	}
+	if len(spec.Command) > 0 {
+		body["Entrypoint"] = []string{}
+	}
+	if spec.Owner != "" {
+		body["Labels"] = map[string]string{"tessera.node": spec.Owner}
 	}
 	exposed := map[string]struct{}{}
 	bindings := map[string][]map[string]string{}
@@ -54,6 +64,16 @@ func (d *Docker) Start(ctx context.Context, spec Spec) (Container, error) {
 		body["ExposedPorts"] = exposed
 	}
 	hostConfig := map[string]any{}
+	if spec.Storage != nil {
+		hostConfig["Mounts"] = []map[string]any{{"Type": "bind", "Source": spec.Storage.Source, "Target": spec.Storage.Target}}
+	}
+	if spec.CheckpointDirectory != "" {
+		info, err := os.Stat(spec.CheckpointDirectory)
+		if err != nil || !info.IsDir() {
+			return Container{}, &StartError{Reason: "shared checkpoint directory is not mounted"}
+		}
+		hostConfig["Binds"] = []string{spec.CheckpointDirectory + ":" + spec.CheckpointDirectory}
+	}
 	if len(bindings) > 0 {
 		hostConfig["PortBindings"] = bindings
 	}
@@ -106,11 +126,14 @@ func (d *Docker) List(ctx context.Context) ([]Container, error) {
 		return nil, err
 	}
 	var items []struct {
-		ID    string   `json:"Id"`
-		Names []string `json:"Names"`
-		State string   `json:"State"`
-		Ports []struct {
-			PublicPort int `json:"PublicPort"`
+		Labels map[string]string `json:"Labels"`
+		ID     string            `json:"Id"`
+		Names  []string          `json:"Names"`
+		State  string            `json:"State"`
+		Ports  []struct {
+			PrivatePort int    `json:"PrivatePort"`
+			Type        string `json:"Type"`
+			PublicPort  int    `json:"PublicPort"`
 		} `json:"Ports"`
 	}
 	if err := json.Unmarshal(resp, &items); err != nil {
@@ -128,9 +151,24 @@ func (d *Docker) List(ctx context.Context) ([]Container, error) {
 		if name == "" {
 			continue
 		}
-		c := Container{ID: it.ID, Name: name, Running: it.State == "running"}
+		c := Container{ID: it.ID, Name: name, Running: it.State == "running", Owner: it.Labels["tessera.node"]}
 		if len(it.Ports) > 0 {
 			c.HostPort = it.Ports[0].PublicPort
+		}
+		for _, port := range it.Ports {
+			if port.PrivatePort > 0 && port.PublicPort > 0 && (port.Type == "tcp" || port.Type == "") {
+				if c.HostPorts == nil {
+					c.HostPorts = map[int]int{}
+				}
+				c.HostPorts[port.PrivatePort] = port.PublicPort
+			}
+		}
+		first := 0
+		for container, host := range c.HostPorts {
+			if first == 0 || container < first {
+				first = container
+				c.HostPort = host
+			}
 		}
 		if !c.Running {
 			inspected, err := d.inspect(ctx, it.ID)
@@ -223,8 +261,30 @@ func (d *Docker) pull(ctx context.Context, image string) error {
 	if tag != "" {
 		q.Set("tag", tag)
 	}
-	_, err := d.call(ctx, http.MethodPost, "/v1.41/images/create?"+q.Encode(), nil)
-	return err
+	body, err := d.call(ctx, http.MethodPost, "/v1.41/images/create?"+q.Encode(), nil)
+	if err != nil {
+		return err
+	}
+	decoder := json.NewDecoder(bytes.NewReader(body))
+	for {
+		var progress struct {
+			Error  string `json:"error"`
+			Detail struct {
+				Message string `json:"message"`
+			} `json:"errorDetail"`
+		}
+		if err := decoder.Decode(&progress); err == io.EOF {
+			return nil
+		} else if err != nil {
+			return err
+		}
+		if progress.Error != "" {
+			return fmt.Errorf("%s", progress.Error)
+		}
+		if progress.Detail.Message != "" {
+			return fmt.Errorf("%s", progress.Detail.Message)
+		}
+	}
 }
 
 func (d *Docker) inspect(ctx context.Context, id string) (Container, error) {
@@ -233,6 +293,9 @@ func (d *Docker) inspect(ctx context.Context, id string) (Container, error) {
 		return Container{}, err
 	}
 	var body struct {
+		Config struct {
+			Labels map[string]string `json:"Labels"`
+		} `json:"Config"`
 		State struct {
 			Running   bool `json:"Running"`
 			OOMKilled bool `json:"OOMKilled"`
@@ -247,14 +310,28 @@ func (d *Docker) inspect(ctx context.Context, id string) (Container, error) {
 	if err := json.Unmarshal(resp, &body); err != nil {
 		return Container{}, err
 	}
-	c := Container{ID: id, Running: body.State.Running, ExitCode: body.State.ExitCode, OOM: body.State.OOMKilled}
+	c := Container{ID: id, Running: body.State.Running, ExitCode: body.State.ExitCode, OOM: body.State.OOMKilled, Owner: body.Config.Labels["tessera.node"]}
 	if c.OOM {
 		c.Reason = "oom"
 	}
-	for _, binds := range body.NetworkSettings.Ports {
+	for key, binds := range body.NetworkSettings.Ports {
 		if len(binds) > 0 && binds[0].HostPort != "" {
-			fmt.Sscanf(binds[0].HostPort, "%d", &c.HostPort)
-			break
+			var container, host int
+			fmt.Sscanf(key, "%d/tcp", &container)
+			fmt.Sscanf(binds[0].HostPort, "%d", &host)
+			if container > 0 && host > 0 && strings.HasSuffix(key, "/tcp") {
+				if c.HostPorts == nil {
+					c.HostPorts = map[int]int{}
+				}
+				c.HostPorts[container] = host
+			}
+		}
+	}
+	first := 0
+	for container, host := range c.HostPorts {
+		if first == 0 || container < first {
+			first = container
+			c.HostPort = host
 		}
 	}
 	return c, nil
@@ -285,6 +362,9 @@ func (d *Docker) call(ctx context.Context, method, path string, body []byte) ([]
 }
 
 func splitRef(image string) (string, string) {
+	if strings.Contains(image, "@") || strings.HasPrefix(image, "sha256:") {
+		return image, ""
+	}
 	slash := strings.LastIndex(image, "/")
 	colon := strings.LastIndex(image, ":")
 	if colon > slash {

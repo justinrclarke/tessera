@@ -33,8 +33,19 @@ func Convert(b []byte) (Result, error) {
 		return Result{}, err
 	}
 	var res Result
+	seen := map[string]bool{}
+	ports := map[int]string{}
+	routeNames := map[string]bool{}
 	for _, doc := range docs {
 		kind := str(doc["kind"])
+		key := kind + "/" + metaName(doc)
+		if kind == "Deployment" || kind == "StatefulSet" || kind == "DaemonSet" || kind == "Job" {
+			key = "workload/" + metaName(doc)
+		}
+		if seen[key] {
+			return Result{}, fmt.Errorf("duplicate converted name %s", key)
+		}
+		seen[key] = true
 		if kind == "Deployment" || kind == "StatefulSet" || kind == "DaemonSet" || kind == "Job" {
 			if reason := unsupportedWorkload(doc); reason != "" {
 				res.Skipped = append(res.Skipped, kind+"/"+metaName(doc)+": "+reason)
@@ -42,15 +53,23 @@ func Convert(b []byte) (Result, error) {
 			}
 		}
 		if kind == "Service" || kind == "Ingress" {
-			routes := routes(doc)
-			if len(routes) == 0 {
-				res.Skipped = append(res.Skipped, kind+"/"+metaName(doc)+": no ports")
+			routes, reason := serviceRoutes(doc, docs)
+			if reason != "" {
+				res.Skipped = append(res.Skipped, kind+"/"+metaName(doc)+": "+reason)
 			}
 			for i := range routes {
 				r := routes[i]
 				if i > 0 {
 					r.Name = fmt.Sprintf("%s-%d", r.Name, r.Port)
 				}
+				if prev := ports[r.Port]; prev != "" {
+					return Result{}, fmt.Errorf("Routes %s and %s require the same listen port %d; assign distinct ports before import", prev, r.Name, r.Port)
+				}
+				ports[r.Port] = r.Name
+				if routeNames[r.Name] {
+					return Result{}, fmt.Errorf("duplicate generated Route name %s", r.Name)
+				}
+				routeNames[r.Name] = true
 				res.Objects = append(res.Objects, api.Object{Kind: api.KindRoute, Route: &r})
 			}
 			continue
@@ -67,16 +86,72 @@ func Convert(b []byte) (Result, error) {
 			res.Objects = append(res.Objects, obj)
 		}
 	}
-	raw, err := yaml.Marshal(export(res.Objects))
+	for _, obj := range res.Objects {
+		if obj.Route == nil {
+			continue
+		}
+		for _, target := range res.Objects {
+			if target.App == nil || target.App.Name != obj.Route.App {
+				continue
+			}
+			found := false
+			for _, port := range target.App.Ports {
+				found = found || port.Container == obj.Route.TargetPort
+			}
+			if !found {
+				target.App.Ports = append(target.App.Ports, api.Port{Container: obj.Route.TargetPort})
+			}
+		}
+	}
+	if len(res.Objects) == 0 {
+		return res, nil
+	}
+	var output bytes.Buffer
+	encoder := yaml.NewEncoder(&output)
+	for _, obj := range export(res.Objects) {
+		if err := encoder.Encode(obj); err != nil {
+			return Result{}, err
+		}
+	}
+	err = encoder.Close()
 	if err != nil {
 		return Result{}, err
 	}
-	res.YAML = string(raw)
+	res.YAML = output.String()
+	if len(res.Objects) > 0 {
+		if _, err := api.DecodeAll([]byte(res.YAML)); err != nil {
+			return Result{}, fmt.Errorf("converted manifest: %w", err)
+		}
+	}
 	return res, nil
 }
 
 func unsupportedWorkload(doc map[string]any) string {
 	spec := mapOf(doc["spec"])
+	switch str(doc["kind"]) {
+	case "DaemonSet":
+		return "per-node DaemonSet placement is not converted"
+	case "StatefulSet":
+		return "stable StatefulSet identity and ordered updates are not converted"
+	case "Job":
+		parallel, complete := 1, 1
+		if spec["parallelism"] != nil {
+			parallel = int(num(spec["parallelism"]))
+		}
+		if spec["completions"] != nil {
+			complete = int(num(spec["completions"]))
+		} else if parallel > 1 {
+			return "work-queue Job completion semantics are not converted"
+		}
+		if parallel != complete || parallel < 1 {
+			return "Jobs with different parallelism and completions are not converted"
+		}
+		for _, field := range []string{"completionMode", "suspend", "backoffLimit", "activeDeadlineSeconds", "podFailurePolicy", "successPolicy", "backoffLimitPerIndex", "maxFailedIndexes"} {
+			if spec[field] != nil {
+				return "Job " + field + " is not converted"
+			}
+		}
+	}
 	pod := mapOf(mapOf(spec["template"])["spec"])
 	if len(sliceOf(spec["volumeClaimTemplates"])) > 0 || len(sliceOf(pod["volumes"])) > 0 {
 		return "storage volumes are not converted"
@@ -84,13 +159,34 @@ func unsupportedWorkload(doc map[string]any) string {
 	if len(sliceOf(pod["containers"])) > 1 || len(sliceOf(pod["initContainers"])) > 0 {
 		return "sidecars and init containers are not converted"
 	}
-	for _, field := range []string{"securityContext", "serviceAccountName", "hostNetwork", "hostPID", "hostIPC"} {
+	for _, field := range []string{"securityContext", "serviceAccountName", "hostNetwork", "hostPID", "hostIPC", "affinity", "tolerations", "topologySpreadConstraints", "nodeName", "imagePullSecrets", "dnsConfig", "schedulerName", "runtimeClassName"} {
 		if value := pod[field]; value != nil && value != false && value != "" {
 			return field + " is not converted"
 		}
 	}
 	for _, item := range sliceOf(pod["containers"]) {
 		container := mapOf(item)
+		if len(sliceOf(container["args"])) > 0 && len(sliceOf(container["command"])) == 0 {
+			return "arguments without an explicit command are not converted"
+		}
+		for _, port := range sliceOf(container["ports"]) {
+			p := mapOf(port)
+			if protocol := str(p["protocol"]); protocol != "" && protocol != "TCP" {
+				return "non-TCP container ports are not converted"
+			}
+		}
+		resources := mapOf(container["resources"])
+		requests, limits := mapOf(resources["requests"]), mapOf(resources["limits"])
+		for resource := range requests {
+			if resource != "cpu" && resource != "memory" && resource != "nvidia.com/gpu" {
+				return "resource " + resource + " is not converted"
+			}
+		}
+		for resource, limit := range limits {
+			if str(limit) != str(requests[resource]) {
+				return "distinct resource requests and limits are not converted"
+			}
+		}
 		for _, field := range []string{"volumeMounts", "volumeDevices", "envFrom", "readinessProbe", "livenessProbe", "startupProbe", "securityContext", "lifecycle"} {
 			if container[field] != nil {
 				return field + " is not converted"
@@ -224,7 +320,7 @@ func documents(b []byte) ([]map[string]any, error) {
 		if len(doc) == 0 {
 			continue
 		}
-		docs = append(docs, doc)
+		docs = append(docs, fromJSON(doc)...)
 	}
 	return docs, nil
 }
@@ -265,10 +361,27 @@ func one(doc map[string]any) (api.Object, string, error) {
 		app, err := workload(doc, api.KindJob)
 		return api.Object{Kind: app.Kind, App: &app}, "", err
 	case "ConfigMap":
+		if len(mapOf(doc["binaryData"])) > 0 || doc["immutable"] == true {
+			return api.Object{}, "ConfigMap/" + metaName(doc) + ": binary or immutable data is not converted", nil
+		}
 		c := api.Config{Kind: api.KindConfig, Name: metaName(doc), Data: stringMap(doc["data"])}
 		return api.Object{Kind: api.KindConfig, Config: &c}, "", nil
 	case "Secret":
-		sec := api.Secret{Kind: api.KindSecret, Name: metaName(doc), Data: secretData(doc["data"])}
+		if kind := str(doc["type"]); kind != "" && kind != "Opaque" || doc["immutable"] == true {
+			return api.Object{}, "Secret/" + metaName(doc) + ": typed or immutable Secrets are not converted", nil
+		}
+		data := map[string]string{}
+		for key, value := range mapOf(doc["data"]) {
+			decoded, err := base64.StdEncoding.DecodeString(str(value))
+			if err != nil {
+				return api.Object{}, "", fmt.Errorf("Secret/%s: invalid base64 data for %s", metaName(doc), key)
+			}
+			data[key] = string(decoded)
+		}
+		for key, value := range stringMap(doc["stringData"]) {
+			data[key] = value
+		}
+		sec := api.Secret{Kind: api.KindSecret, Name: metaName(doc), Data: data}
 		return api.Object{Kind: api.KindSecret, Secret: &sec}, "", nil
 	case "List":
 		return api.Object{}, "", nil
@@ -289,14 +402,15 @@ func workload(doc map[string]any, kind string) (api.App, error) {
 	}
 	c := mapOf(containers[0])
 	app := api.App{
-		Kind:     kind,
-		Name:     metaName(doc),
-		Image:    str(c["image"]),
-		Replicas: int(num(spec["replicas"])),
-		Command:  strSlice(c["command"]),
-		Env:      envOf(c["env"]),
+		Kind:       kind,
+		Name:       metaName(doc),
+		Image:      str(c["image"]),
+		Replicas:   int(num(spec["replicas"])),
+		Command:    append(strSlice(c["command"]), strSlice(c["args"])...),
+		Env:        envOf(c["env"]),
+		NodeLabels: stringMap(tmpl["nodeSelector"]),
 	}
-	if app.Replicas == 0 {
+	if spec["replicas"] == nil {
 		if kind == api.KindJob {
 			app.Replicas = int(num(spec["parallelism"]))
 		}
@@ -304,16 +418,19 @@ func workload(doc map[string]any, kind string) (api.App, error) {
 			app.Replicas = 1
 		}
 	}
-	if kind == api.KindJob && num(spec["completions"]) > 1 && num(spec["parallelism"]) > 1 {
-		app.Gang = true
-	}
 	for _, p := range sliceOf(c["ports"]) {
 		pm := mapOf(p)
-		app.Ports = append(app.Ports, api.Port{Container: int(num(pm["containerPort"]))})
+		app.Ports = append(app.Ports, api.Port{Container: int(num(pm["containerPort"])), Host: int(num(pm["hostPort"]))})
 	}
 	req := mapOf(mapOf(c["resources"])["requests"])
-	cpu, _ := api.ParseMilliCPU(req["cpu"])
-	mem, _ := api.ParseMemory(req["memory"])
+	cpu, err := api.ParseMilliCPU(req["cpu"])
+	if err != nil {
+		return api.App{}, err
+	}
+	mem, err := api.ParseMemory(req["memory"])
+	if err != nil {
+		return api.App{}, err
+	}
 	app.Resources = api.Resources{CPU: cpu, Memory: mem}
 	if gpu := num(req["nvidia.com/gpu"]); gpu > 0 {
 		app.GPUs = int(gpu)
@@ -323,39 +440,6 @@ func workload(doc map[string]any, kind string) (api.App, error) {
 		return api.App{}, fmt.Errorf("%s %s has no image", kind, app.Name)
 	}
 	return app, nil
-}
-
-func routes(doc map[string]any) []api.Route {
-	kind, _ := doc["kind"].(string)
-	if kind == "Service" {
-		var out []api.Route
-		for _, p := range sliceOf(mapOf(doc["spec"])["ports"]) {
-			pm := mapOf(p)
-			out = append(out, api.Route{
-				Kind: api.KindRoute, Name: metaName(doc), App: metaName(doc),
-				Port: int(num(pm["port"])), TargetPort: int(num(pm["targetPort"])),
-			})
-		}
-		return out
-	}
-	var out []api.Route
-	for _, rule := range sliceOf(mapOf(doc["spec"])["rules"]) {
-		rm := mapOf(rule)
-		host := str(rm["host"])
-		paths := sliceOf(mapOf(rm["http"])["paths"])
-		for _, p := range paths {
-			backend := mapOf(mapOf(p)["backend"])
-			svc := mapOf(backend["service"])
-			name := str(svc["name"])
-			port := int(num(mapOf(svc["port"])["number"]))
-			rname := host
-			if rname == "" {
-				rname = name
-			}
-			out = append(out, api.Route{Kind: api.KindRoute, Name: rname, App: name, Port: port, TargetPort: port})
-		}
-	}
-	return out
 }
 
 func export(objs []api.Object) []any {
@@ -378,7 +462,12 @@ func export(objs []api.Object) []any {
 }
 
 func metaName(doc map[string]any) string {
-	return str(mapOf(doc["metadata"])["name"])
+	meta := mapOf(doc["metadata"])
+	name := str(meta["name"])
+	if namespace := str(meta["namespace"]); namespace != "" && namespace != "default" {
+		return namespace + "." + name
+	}
+	return name
 }
 
 func envOf(v any) map[string]string {
@@ -400,19 +489,6 @@ func stringMap(v any) map[string]string {
 	out := map[string]string{}
 	for k, val := range mapOf(v) {
 		out[k] = str(val)
-	}
-	return out
-}
-
-func secretData(v any) map[string]string {
-	out := map[string]string{}
-	for k, val := range mapOf(v) {
-		s := str(val)
-		if dec, err := base64.StdEncoding.DecodeString(s); err == nil && len(dec) > 0 {
-			out[k] = string(dec)
-			continue
-		}
-		out[k] = s
 	}
 	return out
 }

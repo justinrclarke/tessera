@@ -82,7 +82,15 @@ func (s *Store) HasResources() (bool, error) {
 }
 
 func (s *Store) migrate() error {
-	_, err := s.exec(`
+	var version int
+	if err := s.queryRow("PRAGMA user_version").Scan(&version); err != nil {
+		return err
+	}
+	if version < 0 || version > SchemaVersion {
+		return fmt.Errorf("database schema %d requires a newer Tessera binary (supported: %d)", version, SchemaVersion)
+	}
+	return s.Transaction(func(s *Store) error {
+		_, err := s.exec(`
 CREATE TABLE IF NOT EXISTS apps (name TEXT PRIMARY KEY, body TEXT NOT NULL, generation INTEGER NOT NULL);
 CREATE TABLE IF NOT EXISTS app_history (name TEXT NOT NULL, generation INTEGER NOT NULL, body TEXT NOT NULL, PRIMARY KEY (name, generation));
 CREATE TABLE IF NOT EXISTS nodes (id TEXT PRIMARY KEY, body TEXT NOT NULL, last_seen INTEGER NOT NULL, status TEXT NOT NULL);
@@ -93,7 +101,12 @@ CREATE TABLE IF NOT EXISTS configs (name TEXT NOT NULL, kind TEXT NOT NULL, body
 CREATE TABLE IF NOT EXISTS meta (key TEXT PRIMARY KEY, value TEXT NOT NULL);
 CREATE TABLE IF NOT EXISTS snapshots (idx INTEGER PRIMARY KEY, body TEXT NOT NULL, sig TEXT NOT NULL);
 `)
-	return err
+		if err != nil {
+			return err
+		}
+		_, err = s.exec(fmt.Sprintf("PRAGMA user_version=%d", SchemaVersion))
+		return err
+	})
 }
 
 func (s *Store) PutApp(a api.App) error {
@@ -300,6 +313,7 @@ func (s *Store) PendingNodeAction(nodeID string) (api.Action, error) {
 	return one[api.Action](s, `SELECT body FROM actions
 		WHERE json_extract(body, '$.result')='confirmed'
 		AND json_extract(body, '$.target')=?
+		AND COALESCE(json_extract(body, '$.target_kind'),'')!='App'
 		AND json_extract(body, '$.kind') IN ('wipe', 'reimage', 'delete')
 		ORDER BY at ASC LIMIT 1`, nodeID)
 }
@@ -336,6 +350,21 @@ func (s *Store) HasAction(kind, target, reason string) (bool, error) {
 }
 
 func (s *Store) PutRoute(r api.Route) error {
+	if r.Name == "" || r.App == "" || r.Port < 1 || r.Port > 65535 || r.TargetPort < 0 || r.TargetPort > 65535 {
+		return fmt.Errorf("invalid Route name, App, or ports")
+	}
+	routes, err := s.ListRoutes()
+	if err != nil {
+		return err
+	}
+	for _, old := range routes {
+		if old.Name == r.Name && old.Port != r.Port {
+			return fmt.Errorf("route %s listen port stays fixed at %d", r.Name, old.Port)
+		}
+		if old.Name != r.Name && old.Port == r.Port {
+			return fmt.Errorf("route port %d is already used by %s", r.Port, old.Name)
+		}
+	}
 	return s.putJSON("routes", "name", r.Name, r, 0)
 }
 
@@ -438,6 +467,10 @@ func (s *Store) AppendSnapshot(snap api.Snapshot, sig string) error {
 
 func (s *Store) AppendSnapshotRaw(idx uint64, body, sig string) error {
 	_, err := s.exec(`INSERT INTO snapshots(idx, body, sig) VALUES(?, ?, ?)`, idx, body, sig)
+	if err != nil {
+		return err
+	}
+	_, err = s.exec(`DELETE FROM snapshots WHERE idx NOT IN (SELECT idx FROM snapshots ORDER BY idx DESC LIMIT 3)`)
 	return err
 }
 
@@ -467,6 +500,30 @@ func (s *Store) LatestSnapshot() (api.Snapshot, string, error) {
 }
 
 func (s *Store) LoadSnapshot(snap api.Snapshot, epoch uint64) error {
+	if snap.FormatVersion < 0 || snap.FormatVersion > api.StateVersion {
+		return fmt.Errorf("unsupported snapshot format %d", snap.FormatVersion)
+	}
+	for key, value := range snap.Security {
+		if len(key) < 5 || key[:5] != "auth:" {
+			return fmt.Errorf("invalid security snapshot key")
+		}
+		if err := s.SetMeta(key, value); err != nil {
+			return err
+		}
+	}
+	for key, value := range snap.Infrastructure {
+		if len(key) < 6 || key[:6] != "infra:" {
+			return fmt.Errorf("invalid infrastructure snapshot key")
+		}
+		if err := s.SetMeta(key, value); err != nil {
+			return err
+		}
+	}
+	for name, move := range snap.CheckpointMoves {
+		if err := s.SetMeta("checkpoint:"+name, move); err != nil {
+			return err
+		}
+	}
 	for _, a := range snap.Apps {
 		b, err := json.Marshal(a)
 		if err != nil {
@@ -549,6 +606,13 @@ func RestoreBackup(source, target string, minEpoch uint64) error {
 	}
 	defer reader.Close()
 	var check string
+	var version int
+	if err := reader.QueryRow("PRAGMA user_version").Scan(&version); err != nil {
+		return err
+	}
+	if version < 0 || version > SchemaVersion {
+		return fmt.Errorf("backup schema %d requires a newer Tessera binary", version)
+	}
 	if err := reader.QueryRow(`PRAGMA quick_check`).Scan(&check); err != nil {
 		return fmt.Errorf("invalid backup: %w", err)
 	}

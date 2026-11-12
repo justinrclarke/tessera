@@ -32,6 +32,8 @@ State lives in `$TESSERA_DATA` or `~/.tessera`. Override the client with `TESSER
 
 Run `tessera` or `tessera session` to open a session against your configured controller. Enter `get apps`, `apply -f app.yaml`, `import -f deploy.yaml`, or another CLI command to run it. Any other line is a question, answered through the same deterministic diagnosis as `ask`. Commands accept quoted paths, such as `apply -f "my app.yaml"`, and an optional `tessera` prefix. Errors leave the session open. Type `exit` or `quit`, or close standard input, to leave the cluster running. Start long-running processes such as `up`, `agent`, `gateway`, and `mcp` in a separate terminal; use file paths for manifests inside a session.
 
+If an App, Model, or Job has no placement, ask `tessera ask "why is web down?"`. Placement findings explain absent or unavailable nodes, CPU and memory reservations, host-port conflicts, node-label mismatches, and GPU count, model, memory, or device reservations. Gang Jobs report when the remaining workers cannot fit together on the required fabric. A blocked App update explains the spare capacity needed to keep the previous generation running. Missing Config or Secret references are reported for unresolved environments; saved release environments remain usable for rollback. These findings also appear through the read-only MCP `diagnose` and `explain` tools. They do not propose or execute actions. A newly submitted workload that fits may simply be waiting for its agent; a dependency that is not running is reported separately.
+
 ## What you write
 
 Save this as `app.yaml`. Docker assigns separate workload ports so both replicas can run on one node; the Route gives clients a fixed port:
@@ -71,7 +73,7 @@ curl --retry 10 --retry-all-errors --retry-delay 1 http://127.0.0.1:8080/
 
 Use Docker for this HTTP trial. `--runtime fake` exercises the control plane and does not serve the container's HTTP endpoint. `READY` counts assignments passing the configured HTTP readiness check; without `health`, it counts running processes. Unknown App fields and invalid probe settings fail explicitly. Stop the trial workload by changing `replicas` to `0`, applying the file again, and checking `tessera get assignments` for stopped assignments before exiting `up`. Exiting a CLI session leaves workloads running.
 
-Run one Tessera agent per Docker daemon. Its runtime manages containers with the `tessera_` prefix; a second agent pointing at the same daemon can stop the first agent's workloads. The Docker lab gives each node its own daemon. Use disposable stateless workloads for the trial; persistent volumes and stateful identity are not implemented.
+Run one Tessera agent per Docker daemon. Docker workloads carry their node owner, and agents retain only their own containers or recorded legacy assignments. Agent startup locks the Docker daemon identity until exit. Agents in separate containers must share a lock filesystem with `agent --lock-dir /shared/tessera-locks`; a filesystem lock cannot fence separate hosts using a remote daemon. Keep one agent per containerd namespace. The Docker lab gives each node its own daemon. Use disposable stateless workloads for the trial; general persistent volumes and stateful identity are not implemented.
 
 Kinds: App, Job, Model, Route, Config, Secret, Policy. Separate documents with `---`.
 
@@ -87,7 +89,7 @@ A release change (image, command, environment, ports, resources, health, placeme
 
 For Apps, Tessera starts one replacement at a time and keeps the old assignment until the replacement is ready. A generation becomes healthy only when all desired replicas are ready. A failed generation rolls back when a prior healthy generation exists. Spare resources are required; Tessera holds the old workload when no replacement fits. Fixed host ports require a different available node. Jobs retain their cancel-and-replace behavior on a generation change.
 
-`health` checks an HTTP path on the single published container port. Only 2xx responses pass; redirects do not. `timeout` defaults to `2s` per request and `startup_timeout` to `60s`. Until readiness passes, the assignment is `starting` and Routes exclude it. Startup timeout stops the failed replacement and allows rollback. Later readiness failure removes that replica from routing while leaving its process running and checking for recovery; this is not a liveness restart policy. Probe timing survives agent restart. The verified rollout path uses Docker; containerd host-network port placement still needs acceptance. Existing TCP connections to a removed backend may close during cutover; connection draining remains open.
+`health` checks an HTTP path on any published container port. Routes select the matching host mapping using `target_port`. Only 2xx responses pass; redirects do not. `timeout` defaults to `2s` per request and `startup_timeout` to `60s`. Until readiness passes, the assignment is `starting` and Routes exclude it. Startup timeout stops the failed replacement and allows rollback. Later readiness failure removes that replica from routing while leaving its process running and checking for recovery; this is not a liveness restart policy. Probe timing survives agent restart. The verified rollout path uses Docker; containerd host-network port placement still needs acceptance. Set `drain_timeout: 30s` on an App to retain existing TCP connections to its retired backend for up to that interval. New connections use its ready replacement. The old container remains running through the drain interval plus a two-second gateway refresh allowance. Without this setting, cutover can close old connections. Route deletion or credential revocation closes them immediately. A simultaneous long control-plane outage can outlast the refresh allowance.
 
 ## Stable service access
 
@@ -101,7 +103,7 @@ export TESSERA_TOKEN=your-cluster-token
 
 Clients use `http://gateway-host:8080/`. The gateway refreshes ready backend addresses once per second and connects directly to the nodes. It keeps its last accepted backend set during controller outages, so an election or loss of quorum does not stop existing traffic. An authoritative missing Route or authorization failure clears that set. It rejects older controller epochs. A first start requires a reachable controller and an existing Route; a restart cannot recover cached routing while all controllers are unavailable.
 
-The listen port binds on all interfaces. On the same host as a controller, choose a different port, such as `--port 18080`, to avoid conflicting with its Route listener. The gateway requires network access to published node ports. It balances TCP connections, does not replay application requests, and may close connections when their backend is removed. Run it in a separate terminal; no gateway service installation or automatic failover of the gateway itself is implemented. High availability of that address still needs an external load balancer or floating-address arrangement. Controller loss and gateway-host loss are separate acceptance cases.
+The listen port binds on all interfaces. On the same host as a controller, choose a different port, such as `--port 18080`, to avoid conflicting with its Route listener. The gateway requires network access to published node ports. It balances TCP connections, does not replay application requests, and may close connections when their backend is removed. Run it in a separate terminal, or use `tessera install --role gateway --route web --port 18080`. Automatic failover of the gateway itself is not implemented. High availability of that address still needs an external load balancer or floating-address arrangement. Controller loss and gateway-host loss are separate acceptance cases.
 
 An App can include a `build` stanza instead of an `image`. `tessera apply -f app.yaml` builds it with the local Docker CLI before applying the resulting image. The build file names a base image, optional `apk` or `apt` packages, a process command, and a repository. Tessera copies the selected context into `/app`. With `push: true`, Docker uses credentials already configured on the operator's machine and Tessera applies the registry digest. Without push, it applies a local image-ID tag, which is useful only when the controller and nodes can obtain that image through their local runtime or Tessera's image cache.
 
@@ -120,7 +122,23 @@ ports:
   - container: 8080
 ```
 
-Set `push: false` to keep the image local. The pushed App image is pinned to the digest reported by the registry. Changes to the base tag or package repository between builds can produce different image IDs; pin the base image and package versions when repeatability matters.
+Set `push: false` to keep the image local. The pushed App image is pinned to the digest reported by the registry. Changes to the base tag or package repository between builds can produce different image IDs; pin the base image and package versions when repeatability matters. Each built release records its base, package inputs, command, source-tree digest, and resulting image reference. Changing the source while Docker builds is rejected. The source digest includes the whole context, including files excluded by Docker, and is provenance rather than an image signature.
+
+`tessera build -f app.yaml -o release.yaml` builds without changing a cluster. Add `--archive images.tar` with `build.push: false` to produce a private Docker image package. Transfer both files, run `docker load -i images.tar` on the destination runtime, then apply `release.yaml`. Archives keep the exact local content tag; pushed digest releases use their registry instead. No deb/rpm packaging or registry credential distribution is provided.
+
+## Checkpointed gang Jobs
+
+A gang Job can set `checkpoint: {directory: /mnt/training, timeout: 2m}`. Mount the same NFS or other shared filesystem at that absolute path on every eligible node, then select those nodes with labels. Tessera bind-mounts that directory into the workers. It does not create the mount or install storage software. Object-store checkpoint adapters are not implemented.
+
+When a policy permits a faster-gang move, Tessera reserves every replacement and writes `requests/ASSIGNMENT_ID.json` inside the shared directory. The worker must watch its request, save and sync its own data under the request URI's `ASSIGNMENT_ID` subdirectory, then run:
+
+```sh
+tessera checkpoint commit --request /mnt/training/requests/ASSIGNMENT_ID.json --assignment ASSIGNMENT_ID --progress 100
+```
+
+The helper validates the request and atomically writes its completion marker; the training program is responsible for saving and syncing usable data first. The controller waits for every committed marker before requesting any stop, then waits for every old agent's stop acknowledgement before starting replacements. Requests that expire before this point leave the original gang running and release reservations. Requests and move phases survive snapshots and database recovery.
+
+Workers receive `TESSERA_ASSIGNMENT_ID`, `TESSERA_WORKER_RANK`, and `TESSERA_CHECKPOINT_DIRECTORY`. Resumed workers additionally receive `TESSERA_CHECKPOINT_URI`, `TESSERA_CHECKPOINT_GENERATION`, `TESSERA_CHECKPOINT_SOURCE_ASSIGNMENT`, and `TESSERA_CHECKPOINT_PROGRESS`. The program must load that checkpoint and resume. Once the old gang has stopped, an unavailable replacement waits for agent recovery or operator intervention; Tessera does not presume an unreachable worker has stopped. This contract is locally tested with two simulated workers and a shared directory. Actual NFS behavior and training frameworks still need machine acceptance.
 
 ## What it does on its own
 
@@ -130,13 +148,27 @@ If a faster node appears and the gain is at least 15 percent, a stateless app is
 
 If the leader's lease expires, a node holding the snapshot can promote itself. A node that is alone waits 30 seconds, so a short partition does not create a second writer. Agents ignore assignments from an older epoch.
 
-`wipe`, `reimage`, and `delete` are recorded as proposed. Heal does not run them, even if you put them in `auto`. `tessera confirm` lists proposed actions. `tessera confirm <id>` is the only way one runs. Delete removes that app or node. Wipe stops Tessera containers on the node, prunes its runtime, and clears the agent data directory, then removes the node. Reimage does that clear and the agent rejoins empty. Neither wipes the operating system.
+`tessera delete app NAME` or `tessera delete node ID` proposes removal and prints the confirmation ID. `wipe`, `reimage`, and `delete` are recorded as proposed. Heal does not run them, even if you put them in `auto`. `tessera confirm` lists proposed actions. `tessera confirm <id>` is the only way one runs. Delete removes that app or node. Wipe stops Tessera containers on the node, prunes its runtime, and clears the agent data directory, then removes the node. Reimage does that clear and the agent rejoins empty. Neither wipes the operating system.
 
 ## Ask, and MCP
 
 `tessera ask` answers from findings and the action log. If `TESSERA_LLM_URL` and `TESSERA_LLM_KEY` are set, a short note is appended. The model is not required, and it is not on the heal path.
 
 `tessera mcp` speaks MCP over stdio. Tools are read-only: `list_apps`, `get_app`, `list_nodes`, `get_node`, `logs`, `diagnose`, `list_actions`, `explain`, `metrics`.
+
+## Scoped credentials
+
+The original cluster token is an administrator credential and is also the immutable replication and snapshot-signing root. Trusted legacy agents can retain full snapshots and promote a standalone controller. For new workers, mint a short-lived, node-bound bootstrap token on the administrator's machine:
+
+```sh
+tessera token join --node worker-a --ttl 10m
+```
+
+Transfer the printed token privately. Start that node with `TESSERA_TOKEN=JOIN_TOKEN tessera agent --restricted --id worker-a --url http://controller:7468`, or add the same flags to `install`. Registration saves a private scoped node credential. Restarts use it after the bootstrap token expires. Workers can access their own assignments and image downloads, and report their own status. They cannot read other nodes' assignments, cluster Secrets or snapshots, or change manifests and confirmations. Restricted workers do not promote standalone controllers or upload images to the controller cache; supply a reachable registry or operator-populated cache for them.
+
+`tessera token gateway --route web` prints a credential limited to that Route's backends and controller status. Use it as the gateway's `TESSERA_TOKEN`. `tessera token revoke --node worker-a` revokes the node credential and all previously minted bootstrap tokens for that node. Mint a fresh bootstrap token to authorize rejoining.
+
+`tessera token rotate` changes the administrator API credential while retaining scoped workers and gateways. First rejoin all legacy nodes as restricted workers; rotation refuses while any trusted legacy node remains. The CLI verifies the new key and updates private `client.json`, preserving the replication root in `token`. Controller restart preserves the saved API credential, and an existing store refuses a different replication root. Update any `TESSERA_TOKEN` overrides. An ambiguous network result keeps a private `pending-api-token`; `tessera token recover` verifies that key before updating the client. Keep that file until recovery succeeds. API traffic still requires a trusted LAN or an HTTPS reverse proxy; scoped credentials do not encrypt HTTP.
 
 ## Kubernetes
 
@@ -165,6 +197,15 @@ Import skips and reports workloads requiring storage volumes, sidecars, init con
 ```
 
 For the first machine, run `tessera controller` in one terminal, then `tessera install` in another to start its agent from the saved configuration. `tessera up` remains the combined controller and agent path for foreground use. Keep one agent process per node data directory. Re-running install replaces the binary atomically and restarts the user service. `--no-start` writes the files without changing the running service; omit it on a subsequent install to activate the service. Service startup errors are reported even when the files were installed successfully. macOS writes agent output to `DATA_DIRECTORY/agent.log`; Linux uses the user journal. These are user services and follow the platform's user-session lifecycle.
+
+Install controller and gateway services into separate data directories:
+
+```sh
+tessera install --role controller --data ~/.tessera-controller --advertise-url http://controller:7468 --token "$TESSERA_TOKEN"
+tessera install --role gateway --data ~/.tessera-gateway --url http://controller:7468 --route web --port 18080 --token "$TESSERA_TOKEN"
+```
+
+Controller replica installation additionally accepts `--id`, `--raft-listen`, `--peers`, and the first-start `--bootstrap` flag. Clear `--bootstrap` after initialization. Services and logs have distinct role names. Generated files and service commands are tested for macOS and Linux; reboot, native service-manager upgrades, mixed-version rolling upgrades, and schema downgrade compatibility remain unverified. Retain a database backup and its matching binary before upgrading; restore into a new directory for rollback.
 
 `tessera backup -o tessera-backup.db` copies the local SQLite store through a read-only connection while the controller may be running. For an offline replacement controller, run `tessera restore -f tessera-backup.db --data NEW_DIRECTORY` before starting it. Restore checks the backup, refuses an existing database, preserves the cluster token and committed data, assigns a fresh controller identity, and advances the leader epoch. A replica backup also clears old consensus metadata and logs. `--epoch N` sets a higher minimum epoch when agents have seen a later leader. Stop or fence every previous controller before starting the replacement; image cache files are separate from the database backup.
 
@@ -206,15 +247,66 @@ Two controllers are required to commit changes. If a majority is unreachable, ex
 
 The process acceptance test starts three CLI controllers with private temporary stores and real TCP/TLS replication, kills a leader abruptly, removes quorum, and recovers quorum from a restarted replica without restarting the workload. It continuously sends HTTP requests through an independent gateway at one stable address during leader and quorum loss. Run it with `go test ./cmd/tessera -run TestControllerProcesses -count=1`. It complements the full snapshot, log, partition, and offline-recovery tests; it does not establish cross-machine networking or gateway-host failover.
 
+The opt-in three-host drill uses SSH to run this checkout on three disposable Linux machines. It builds the required amd64 or arm64 binaries locally; the hosts do not need Go or an installed Tessera binary. The first host needs access to its system Docker socket and a cached `busybox:latest` image. It must have no existing Tessera agents or containers. SSH must work without an interactive prompt. Each `address` is reachable from the other hosts and the computer running the test; agents must advertise a reachable IPv4 address. Allow TCP ports 17468–17470 between the machines and access to the worker's dynamically published Docker ports from the test computer and controllers. `TESSERA_ACCEPT_PORT` changes the starting port.
+
+```sh
+export TESSERA_ACCEPT_HOSTS='[{"ssh":"user@host-a","address":"10.0.0.11"},{"ssh":"user@host-b","address":"10.0.0.12"},{"ssh":"user@host-c","address":"10.0.0.13"}]'
+go test ./cmd/tessera -run '^TestThreeHostControllerAcceptance$' -count=1 -timeout 10m -v
+unset TESSERA_ACCEPT_HOSTS
+```
+
+The drill checks distinct Linux machine IDs, starts three controllers and one Docker agent, then kills controller processes while continuously requesting one gateway address on the test computer. It measures leader election, replica catch-up, quorum recovery, full cluster restart, and offline restore. A minority must reject a write with HTTP 503; the rejected App update must remain absent after recovery. Assignment ID, Docker container ID, start time, and restart count must stay unchanged. The offline replacement starts only after all three original controllers have stopped. This tests controller process loss across hosts, not host power loss, node rescheduling, gateway-host failover, or connection draining.
+
+Private logs and a JSON report are saved under `lab/results/controllers-*`; set `TESSERA_ACCEPT_RESULTS` to choose another directory. Cleanup removes the drill's processes, workload containers, and temporary stores, leaving the cached image in place. An incomplete process cleanup preserves its temporary store and the worker's `/tmp/tessera-accept-docker.lock` for inspection. Run Docker drills sequentially; the acceptance harness reserves its test runtime and fixed ports.
+
+Rehearse the same sequence locally with `TESSERA_ACCEPT_LOCAL=1 go test ./cmd/tessera -run '^TestThreeHostControllerAcceptance$' -count=1 -timeout 10m -v`. This mode uses three local controller processes and real Docker, and records `local-rehearsal` in its report. It does not satisfy the three-machine gate. The normal test suite skips this drill unless one of these environment settings is supplied.
+
 Databases, sidecars, and backups contain cluster credentials and Secret values and use private file permissions. Raft snapshot directories are private. Keep application-data backups separate: `tessera backup` copies control-plane state and does not back up volumes or container filesystems. See the trial and reliability gates in [ROADMAP.md](ROADMAP.md) for remaining installation, upgrade, gateway availability, access-control, and capacity gates. The default drill verifies HTTP service through slow startup and invalid-image rollback. With a cached `busybox:latest`, `TESSERA_DOCKER_SMOKE=1 go test ./internal/drill -run TestDockerReadinessRolloutSmoke -count=1 -v` verifies actual Docker startup, ready cutover, and failed-command rollback using only containers created by that test.
 
 `tessera up` restarts itself through a watchdog unless you pass `--watched` or set `TESSERA_WATCHED=1`. A clean exit is not restarted. A child that dies within 500ms is not restarted either.
 
-## Cloud inventory
+## Cloud infrastructure
 
-`tessera cloud inventory --provider aws --region us-east-1`, `--provider gcp --project PROJECT`, or `--provider azure --subscription SUBSCRIPTION` reads VM lists through the installed AWS, gcloud, or Azure CLI and its existing login. This is read-only discovery. It does not create VMs or make them Tessera Nodes; an instance becomes a Node when its Tessera agent joins with the cluster token. Cloud inventory adapters are covered by scripted local tests, while real account validation remains open.
+`tessera cloud inventory --provider aws --region us-east-1`, `--provider gcp --project PROJECT`, or `--provider azure --subscription SUBSCRIPTION` reads VM lists through the installed AWS, gcloud, or Azure CLI and its existing login. Provisioning uses the same credentials on the elected controller. Provider account credentials stay on the controller; workers receive only their own expiring join credential.
 
-`tessera infra plan -f desired.yaml [--state current.json]` previews a file with `networks`, `machines`, and `apps`. The optional state file is a local JSON fixture with the same resource names and `owned` flags; without it, the planner treats every desired resource as missing. This preview makes no cloud calls. It orders network, machine, and App changes, produces a stable generation hash, and marks changes to networks or machines and removal of owned resources as `confirm`. Adopted resources absent from the desired file are left alone. Cloud backed state discovery and `infra apply` are still planned.
+```yaml
+providers:
+  aws:
+    ssh_key: operator-key
+networks:
+- name: private
+  provider: aws
+  region: us-east-1
+  cidr: 10.42.0.0/24
+machines:
+- name: worker
+  provider: aws
+  region: us-east-1
+  type: t3.small
+  image: ami-your-prebuilt-linux-docker-tessera
+  network: private
+apps:
+- name: web
+  image: registry.example.com/team/web@sha256:YOUR_DIGEST
+  replicas: 1
+```
+
+```sh
+tessera infra plan -f infrastructure.yaml
+tessera infra apply -f infrastructure.yaml
+tessera infra status
+tessera infra rollback
+```
+
+Planning reads recorded controller state when configured, or `--state current.json` for a local preview; it makes no cloud calls. Apply records intent, ownership keys, provider IDs, and a stable generation before external effects. It creates networks before machines and waits for their agents before applying Apps. AWS networks use a recoverable CloudFormation stack; GCP uses a custom network and subnet; Azure uses a virtual network and subnet. Reconciliation retries interrupted operations by ownership key, periodically inspects owned resources, and recreates missing machines with a fresh provider idempotency key. The local tests cover lost responses, snapshot recovery, repeated apply, replacement and rollback keys, adoption, confirmation, and abandonment.
+
+Images must already contain Linux, systemd, Docker, and `tessera` on PATH. Bootstrap installs a system service with an expiring node-bound join token and private scoped worker credentials. Configure a reachable controller address and networking before trying this: private networks do not include NAT, internet gateways, peering, VPN setup, or firewall rules. GCP provisioning disables an external IP; Azure disables public IP and automatic NSG creation. Azure requires `resource_group`, `admin_user`, and `ssh_key` provider settings; GCP uses `project`. For GCP, machine and network `region` values use the same zone; Tessera derives the subnet region. Provider settings cannot change while recorded machines or networks exist.
+
+Set `adopt: PROVIDER_INSTANCE_ID` and `node_id: EXISTING_NODE_ID` on a machine to record an existing instance. Join its agent separately. Adopted machines are never removed or replaced. An App that already exists outside the intent is also retained when removed from that file. Every owned removal or replacement proposes a `delete` action; inspect it with `tessera confirm` and explicitly confirm its ID. A machine with active workloads and a network with attached recorded machines remain blocked. Drain workloads before changing their host. VM removal does not promise cleanup of every provider-created disk or interface.
+
+`infra rollback [--generation HASH]` selects a prior intent; it uses the same reconciliation and confirmation rules. It does not revert application data. Resolve a pending provider operation before changing intent. If its result cannot be determined, `tessera infra abandon-pending` proposes an abandonment requiring confirmation; it preserves the original intent and ownership key for manual resource review, then allows rollback. It does not delete possible orphaned resources.
+
+AWS, GCP, and Azure adapters are covered by scripted CLI responses. No cloud account was accessed for these tests; disposable live-account provisioning, joining, connectivity, and cleanup acceptance remain open. Provider CLI references: [AWS](https://docs.aws.amazon.com/cli/latest/reference/ec2/run-instances.html), [GCP](https://docs.cloud.google.com/sdk/gcloud/reference/compute/instances/create), [Azure](https://learn.microsoft.com/en-us/cli/azure/vm?view=azure-cli-latest).
 
 ## Check
 
@@ -225,7 +317,18 @@ go test ./internal/drill -count=1
 
 `tessera get nodes` shows the join benchmark: CPU, memory, and disk. It is recorded once, then refreshed hourly.
 
-`tessera drill` runs the same acceptance suite: placement, dead-node reschedule, rollback, a refused wipe, epoch fencing, restore from the local cache, leader promotion, a move onto a faster node, certificate renewal, route cutover, the image cache, and confirm. It does not need Docker.
+`tessera drill` runs the same acceptance suite: placement, dead-node reschedule, rollback, a refused wipe, epoch fencing, restore from the local cache, leader promotion, a move onto a faster node, certificate renewal, route cutover, the image cache, and confirm. It also verifies a two-worker checkpoint move and scoped-worker continuity through API token rotation. It does not need Docker.
+
+History retention keeps three signed snapshots, the latest 1,000 completed actions, and 1,000 eligible terminal assignments. Proposed and confirmed actions, active assignments, completed workers from the current Job generation, and assignments referenced by active checkpoint moves are preserved. Active App history retains its latest 20 releases plus the healthy rollback release. History pruning runs every 128 snapshots. Image-cache files need operator disk management; these bounds do not establish cluster-size or disk-exhaustion guarantees.
+
+Optional local checks, run sequentially against a disposable Docker environment:
+
+```sh
+TESSERA_DOCKER_REGISTRY_SMOKE=1 go test ./internal/drill -run TestPublishedBuildSecondClusterAndDigestRollback -count=1
+TESSERA_DOCKER_BUILD_SMOKE=1 go test ./cmd/tessera -run TestBuildOfflineArchiveRestoresManifestReference -count=1
+```
+
+The registry drill runs two independent temporary Tessera controllers and real Docker agents, removes local image references before the second cluster pulls, and verifies failed-release rollback preserves the previous digest and build record. Both clusters share the local Docker daemon with distinct workload ownership; this proves the local registry path, not cross-machine access or registry authentication distribution.
 
 ## Local Docker lab
 

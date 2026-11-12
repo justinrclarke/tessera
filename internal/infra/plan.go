@@ -1,6 +1,7 @@
 package infra
 
 import (
+	"bytes"
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
@@ -10,6 +11,7 @@ import (
 	"sort"
 
 	"tessera/internal/api"
+	"tessera/internal/cloud"
 
 	"gopkg.in/yaml.v3"
 )
@@ -22,6 +24,8 @@ type Network struct {
 }
 
 type Machine struct {
+	Adopt    string `json:"adopt,omitempty" yaml:"adopt,omitempty"`
+	NodeID   string `json:"node_id,omitempty" yaml:"node_id,omitempty"`
 	Name     string `json:"name" yaml:"name"`
 	Provider string `json:"provider" yaml:"provider"`
 	Region   string `json:"region" yaml:"region"`
@@ -31,19 +35,23 @@ type Machine struct {
 }
 
 type Desired struct {
-	Networks []Network `json:"networks" yaml:"networks"`
-	Machines []Machine `json:"machines" yaml:"machines"`
-	Apps     []api.App `json:"apps" yaml:"apps"`
+	Providers map[string]cloud.Settings `json:"providers,omitempty" yaml:"providers,omitempty"`
+	Networks  []Network                 `json:"networks" yaml:"networks"`
+	Machines  []Machine                 `json:"machines" yaml:"machines"`
+	Apps      []api.App                 `json:"apps" yaml:"apps"`
 }
 
 type ExistingNetwork struct {
-	Network Network `json:"network"`
-	Owned   bool    `json:"owned"`
+	Resource cloud.Resource `json:"resource"`
+	Network  Network        `json:"network"`
+	Owned    bool           `json:"owned"`
 }
 
 type ExistingMachine struct {
-	Machine Machine `json:"machine"`
-	Owned   bool    `json:"owned"`
+	Resource cloud.Resource `json:"resource"`
+	NodeID   string         `json:"node_id"`
+	Machine  Machine        `json:"machine"`
+	Owned    bool           `json:"owned"`
 }
 
 type ExistingApp struct {
@@ -71,14 +79,17 @@ type Result struct {
 
 func Parse(raw []byte) (Desired, error) {
 	var file struct {
-		Networks []Network        `yaml:"networks"`
-		Machines []Machine        `yaml:"machines"`
-		Apps     []map[string]any `yaml:"apps"`
+		Providers map[string]cloud.Settings `yaml:"providers"`
+		Networks  []Network                 `yaml:"networks"`
+		Machines  []Machine                 `yaml:"machines"`
+		Apps      []map[string]any          `yaml:"apps"`
 	}
-	if err := yaml.Unmarshal(raw, &file); err != nil {
+	decoder := yaml.NewDecoder(bytes.NewReader(raw))
+	decoder.KnownFields(true)
+	if err := decoder.Decode(&file); err != nil {
 		return Desired{}, err
 	}
-	desired := Desired{Networks: file.Networks, Machines: file.Machines}
+	desired := Desired{Providers: file.Providers, Networks: file.Networks, Machines: file.Machines}
 	for _, appRaw := range file.Apps {
 		if appRaw["kind"] == nil {
 			appRaw["kind"] = api.KindApp
@@ -123,6 +134,9 @@ func (d Desired) Validate() error {
 			return fmt.Errorf("duplicate machine %q", m.Name)
 		}
 		machines[m.Name] = true
+		if m.Adopt != "" && m.NodeID == "" {
+			return fmt.Errorf("adopted machine %q requires its existing node_id", m.Name)
+		}
 		if m.Network != "" {
 			network, exists := networks[m.Network]
 			if !exists || network.Provider != m.Provider || network.Region != m.Region {
@@ -145,9 +159,10 @@ func Plan(desired Desired, current State) (Result, error) {
 		return Result{}, err
 	}
 	canonicalDesired := Desired{
-		Networks: append([]Network(nil), desired.Networks...),
-		Machines: append([]Machine(nil), desired.Machines...),
-		Apps:     append([]api.App(nil), desired.Apps...),
+		Providers: desired.Providers,
+		Networks:  append([]Network(nil), desired.Networks...),
+		Machines:  append([]Machine(nil), desired.Machines...),
+		Apps:      append([]api.App(nil), desired.Apps...),
 	}
 	sort.Slice(canonicalDesired.Networks, func(a, b int) bool { return canonicalDesired.Networks[a].Name < canonicalDesired.Networks[b].Name })
 	sort.Slice(canonicalDesired.Machines, func(a, b int) bool { return canonicalDesired.Machines[a].Name < canonicalDesired.Machines[b].Name })

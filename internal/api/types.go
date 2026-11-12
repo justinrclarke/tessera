@@ -1,8 +1,13 @@
 package api
 
-import "time"
+import (
+	"reflect"
+	"time"
+)
 
-const Version = "0.4.0"
+const Version = "0.4.1-dev"
+
+const StateVersion = 1
 
 const (
 	StatusPending   = "pending"
@@ -11,6 +16,9 @@ const (
 	StatusFailed    = "failed"
 	StatusSucceeded = "succeeded"
 	StatusStopped   = "stopped"
+	StatusStopping  = "stopping"
+	StatusReserved  = "reserved"
+	StatusDraining  = "draining"
 
 	NodeReady    = "ready"
 	NodeSuspect  = "suspect"
@@ -58,6 +66,10 @@ type Health struct {
 }
 
 type App struct {
+	Storage           *Storage          `json:"storage,omitempty" yaml:"storage,omitempty"`
+	DrainTimeout      string            `json:"drain_timeout,omitempty" yaml:"drain_timeout,omitempty"`
+	Artifact          *BuildRecord      `json:"artifact,omitempty" yaml:"artifact,omitempty"`
+	Checkpoint        *Checkpoint       `json:"checkpoint,omitempty" yaml:"checkpoint,omitempty"`
 	Kind              string            `json:"kind" yaml:"kind"`
 	Name              string            `json:"name" yaml:"name"`
 	Image             string            `json:"image" yaml:"image"`
@@ -84,48 +96,59 @@ type App struct {
 }
 
 type Node struct {
-	ID            string            `json:"id" yaml:"id"`
-	Addr          string            `json:"addr,omitempty" yaml:"addr,omitempty"`
-	Status        string            `json:"status" yaml:"status"`
-	Capacity      Resources         `json:"capacity" yaml:"capacity"`
-	Free          Resources         `json:"free" yaml:"free"`
-	Perf          Perf              `json:"perf" yaml:"perf"`
-	Score         float64           `json:"score" yaml:"score"`
-	GPUs          int               `json:"gpus" yaml:"gpus"`
-	GPUInventory  []GPU             `json:"gpu_inventory,omitempty" yaml:"gpu_inventory,omitempty"`
-	Labels        map[string]string `json:"labels,omitempty" yaml:"labels,omitempty"`
-	LastSeen      time.Time         `json:"last_seen" yaml:"last_seen"`
-	CordonedAt    time.Time         `json:"cordoned_at,omitempty" yaml:"cordoned_at,omitempty"`
-	DiskFree      int64             `json:"disk_free" yaml:"disk_free"`
-	DiskTotal     int64             `json:"disk_total" yaml:"disk_total"`
-	CertNotBefore time.Time         `json:"cert_not_before,omitempty" yaml:"cert_not_before,omitempty"`
-	CertNotAfter  time.Time         `json:"cert_not_after,omitempty" yaml:"cert_not_after,omitempty"`
-	Epoch         uint64            `json:"epoch" yaml:"epoch"`
+	StorageCapable bool              `json:"storage_capable,omitempty" yaml:"storage_capable,omitempty"`
+	Restricted     bool              `json:"restricted,omitempty" yaml:"restricted,omitempty"`
+	Runtime        string            `json:"runtime,omitempty" yaml:"runtime,omitempty"`
+	Cloud          *CloudIdentity    `json:"cloud,omitempty" yaml:"cloud,omitempty"`
+	ID             string            `json:"id" yaml:"id"`
+	Addr           string            `json:"addr,omitempty" yaml:"addr,omitempty"`
+	Status         string            `json:"status" yaml:"status"`
+	Capacity       Resources         `json:"capacity" yaml:"capacity"`
+	Free           Resources         `json:"free" yaml:"free"`
+	Perf           Perf              `json:"perf" yaml:"perf"`
+	Score          float64           `json:"score" yaml:"score"`
+	GPUs           int               `json:"gpus" yaml:"gpus"`
+	GPUInventory   []GPU             `json:"gpu_inventory,omitempty" yaml:"gpu_inventory,omitempty"`
+	Labels         map[string]string `json:"labels,omitempty" yaml:"labels,omitempty"`
+	LastSeen       time.Time         `json:"last_seen" yaml:"last_seen"`
+	CordonedAt     time.Time         `json:"cordoned_at,omitempty" yaml:"cordoned_at,omitempty"`
+	DiskFree       int64             `json:"disk_free" yaml:"disk_free"`
+	DiskTotal      int64             `json:"disk_total" yaml:"disk_total"`
+	CertNotBefore  time.Time         `json:"cert_not_before,omitempty" yaml:"cert_not_before,omitempty"`
+	CertNotAfter   time.Time         `json:"cert_not_after,omitempty" yaml:"cert_not_after,omitempty"`
+	Epoch          uint64            `json:"epoch" yaml:"epoch"`
 }
 
 type Assignment struct {
-	ID         string            `json:"id" yaml:"id"`
-	App        string            `json:"app" yaml:"app"`
-	NodeID     string            `json:"node_id" yaml:"node_id"`
-	Image      string            `json:"image" yaml:"image"`
-	Generation int64             `json:"generation" yaml:"generation"`
-	Epoch      uint64            `json:"epoch" yaml:"epoch"`
-	Status     string            `json:"status" yaml:"status"`
-	Reason     string            `json:"reason,omitempty" yaml:"reason,omitempty"`
-	Restarts   int               `json:"restarts" yaml:"restarts"`
-	Replaces   string            `json:"replaces,omitempty" yaml:"replaces,omitempty"`
-	RuntimeID  string            `json:"runtime_id,omitempty" yaml:"runtime_id,omitempty"`
-	HostPort   int               `json:"host_port,omitempty" yaml:"host_port,omitempty"`
-	Logs       string            `json:"logs,omitempty" yaml:"logs,omitempty"`
-	Env        map[string]string `json:"env,omitempty" yaml:"env,omitempty"`
-	Command    []string          `json:"command,omitempty" yaml:"command,omitempty"`
-	Ports      []Port            `json:"ports,omitempty" yaml:"ports,omitempty"`
-	Resources  Resources         `json:"resources" yaml:"resources"`
-	GPUs       int               `json:"gpus,omitempty" yaml:"gpus,omitempty"`
-	GPUDevices []string          `json:"gpu_devices,omitempty" yaml:"gpu_devices,omitempty"`
-	Kind       string            `json:"kind" yaml:"kind"`
-	Health     *Health           `json:"health,omitempty" yaml:"health,omitempty"`
-	Updated    time.Time         `json:"updated" yaml:"updated"`
+	Storage             *Storage           `json:"storage,omitempty" yaml:"storage,omitempty"`
+	HostPorts           map[int]int        `json:"host_ports,omitempty" yaml:"host_ports,omitempty"`
+	StopAfter           time.Time          `json:"stop_after,omitempty" yaml:"stop_after,omitempty"`
+	CheckpointDirectory string             `json:"checkpoint_directory,omitempty" yaml:"checkpoint_directory,omitempty"`
+	Checkpoint          *CheckpointRequest `json:"checkpoint,omitempty" yaml:"checkpoint,omitempty"`
+	CheckpointDone      string             `json:"checkpoint_done,omitempty" yaml:"checkpoint_done,omitempty"`
+	CheckpointProgress  int64              `json:"checkpoint_progress,omitempty" yaml:"checkpoint_progress,omitempty"`
+	ID                  string             `json:"id" yaml:"id"`
+	App                 string             `json:"app" yaml:"app"`
+	NodeID              string             `json:"node_id" yaml:"node_id"`
+	Image               string             `json:"image" yaml:"image"`
+	Generation          int64              `json:"generation" yaml:"generation"`
+	Epoch               uint64             `json:"epoch" yaml:"epoch"`
+	Status              string             `json:"status" yaml:"status"`
+	Reason              string             `json:"reason,omitempty" yaml:"reason,omitempty"`
+	Restarts            int                `json:"restarts" yaml:"restarts"`
+	Replaces            string             `json:"replaces,omitempty" yaml:"replaces,omitempty"`
+	RuntimeID           string             `json:"runtime_id,omitempty" yaml:"runtime_id,omitempty"`
+	HostPort            int                `json:"host_port,omitempty" yaml:"host_port,omitempty"`
+	Logs                string             `json:"logs,omitempty" yaml:"logs,omitempty"`
+	Env                 map[string]string  `json:"env,omitempty" yaml:"env,omitempty"`
+	Command             []string           `json:"command,omitempty" yaml:"command,omitempty"`
+	Ports               []Port             `json:"ports,omitempty" yaml:"ports,omitempty"`
+	Resources           Resources          `json:"resources" yaml:"resources"`
+	GPUs                int                `json:"gpus,omitempty" yaml:"gpus,omitempty"`
+	GPUDevices          []string           `json:"gpu_devices,omitempty" yaml:"gpu_devices,omitempty"`
+	Kind                string             `json:"kind" yaml:"kind"`
+	Health              *Health            `json:"health,omitempty" yaml:"health,omitempty"`
+	Updated             time.Time          `json:"updated" yaml:"updated"`
 }
 
 type Route struct {
@@ -162,27 +185,32 @@ type Policy struct {
 }
 
 type Action struct {
-	ID     string    `json:"id" yaml:"id"`
-	At     time.Time `json:"at" yaml:"at"`
-	Actor  string    `json:"actor" yaml:"actor"`
-	Kind   string    `json:"kind" yaml:"kind"`
-	Target string    `json:"target" yaml:"target"`
-	Reason string    `json:"reason" yaml:"reason"`
-	Result string    `json:"result" yaml:"result"`
+	TargetKind string    `json:"target_kind,omitempty" yaml:"target_kind,omitempty"`
+	ID         string    `json:"id" yaml:"id"`
+	At         time.Time `json:"at" yaml:"at"`
+	Actor      string    `json:"actor" yaml:"actor"`
+	Kind       string    `json:"kind" yaml:"kind"`
+	Target     string    `json:"target" yaml:"target"`
+	Reason     string    `json:"reason" yaml:"reason"`
+	Result     string    `json:"result" yaml:"result"`
 }
 
 type Snapshot struct {
-	Controllers []string     `json:"controllers,omitempty"`
-	Index       uint64       `json:"index"`
-	Epoch       uint64       `json:"epoch"`
-	LeaderID    string       `json:"leader_id"`
-	Taken       time.Time    `json:"taken"`
-	Apps        []App        `json:"apps"`
-	Assignments []Assignment `json:"assignments"`
-	Policy      Policy       `json:"policy"`
-	Routes      []Route      `json:"routes"`
-	Configs     []Config     `json:"configs"`
-	Secrets     []Secret     `json:"secrets"`
+	FormatVersion   int               `json:"format_version,omitempty"`
+	Security        map[string]string `json:"security,omitempty"`
+	Infrastructure  map[string]string `json:"infrastructure,omitempty"`
+	CheckpointMoves map[string]string `json:"checkpoint_moves,omitempty"`
+	Controllers     []string          `json:"controllers,omitempty"`
+	Index           uint64            `json:"index"`
+	Epoch           uint64            `json:"epoch"`
+	LeaderID        string            `json:"leader_id"`
+	Taken           time.Time         `json:"taken"`
+	Apps            []App             `json:"apps"`
+	Assignments     []Assignment      `json:"assignments"`
+	Policy          Policy            `json:"policy"`
+	Routes          []Route           `json:"routes"`
+	Configs         []Config          `json:"configs"`
+	Secrets         []Secret          `json:"secrets"`
 }
 
 type Lease struct {
@@ -207,8 +235,9 @@ type ControllerStatus struct {
 }
 
 type RouteBackends struct {
-	Epoch    uint64   `json:"epoch"`
-	Backends []string `json:"backends"`
+	DrainTimeout string   `json:"drain_timeout,omitempty"`
+	Epoch        uint64   `json:"epoch"`
+	Backends     []string `json:"backends"`
 }
 
 func (p Policy) Cooldown() time.Duration {
@@ -252,6 +281,18 @@ func (p Policy) Lease() time.Duration {
 }
 
 func (a App) ReleaseEqual(b App) bool {
+	if !reflect.DeepEqual(a.Storage, b.Storage) {
+		return false
+	}
+	if a.DrainTimeout != b.DrainTimeout {
+		return false
+	}
+	if !reflect.DeepEqual(a.Artifact, b.Artifact) {
+		return false
+	}
+	if (a.Checkpoint == nil) != (b.Checkpoint == nil) || (a.Checkpoint != nil && *a.Checkpoint != *b.Checkpoint) {
+		return false
+	}
 	if a.Resources != b.Resources || len(a.Ports) != len(b.Ports) || len(a.DependsOn) != len(b.DependsOn) || (a.Health == nil) != (b.Health == nil) {
 		return false
 	}

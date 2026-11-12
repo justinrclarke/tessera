@@ -9,6 +9,8 @@ import (
 	"net/http"
 	"strings"
 	"time"
+	"unicode"
+	"unicode/utf8"
 
 	"tessera/internal/api"
 	"tessera/internal/diagnose"
@@ -141,12 +143,32 @@ func (o OpenAI) Complete(ctx context.Context, prompt string) (string, error) {
 
 func matchApp(q string, apps []api.App) string {
 	ql := strings.ToLower(q)
+	focus := ""
 	for _, a := range apps {
-		if a.Name != "" && strings.Contains(ql, strings.ToLower(a.Name)) {
-			return a.Name
+		if a.Name != "" && len(a.Name) > len(focus) && mentions(ql, strings.ToLower(a.Name)) {
+			focus = a.Name
 		}
 	}
-	return ""
+	return focus
+}
+
+func mentions(question, name string) bool {
+	word := func(r rune) bool { return unicode.IsLetter(r) || unicode.IsDigit(r) || r == '_' || r == '-' }
+	for offset := 0; offset < len(question); {
+		index := strings.Index(question[offset:], name)
+		if index < 0 {
+			return false
+		}
+		index += offset
+		end := index + len(name)
+		before, _ := utf8.DecodeLastRuneInString(question[:index])
+		after, _ := utf8.DecodeRuneInString(question[end:])
+		if !word(before) && !word(after) {
+			return true
+		}
+		offset = end
+	}
+	return false
 }
 
 func findApp(apps []api.App, name string) api.App {
@@ -176,7 +198,7 @@ func appLine(a api.App, asgs []api.Assignment) string {
 func filterFindings(in []diagnose.Finding, name string) []diagnose.Finding {
 	var out []diagnose.Finding
 	for _, f := range in {
-		if f.Target == name || strings.Contains(f.Summary, name) {
+		if f.Target == name {
 			out = append(out, f)
 		}
 	}
@@ -186,7 +208,7 @@ func filterFindings(in []diagnose.Finding, name string) []diagnose.Finding {
 func filterActions(in []api.Action, name string) []api.Action {
 	var out []api.Action
 	for _, a := range in {
-		if a.Target == name || strings.Contains(a.Reason, name) {
+		if a.Target == name {
 			out = append(out, a)
 		}
 	}

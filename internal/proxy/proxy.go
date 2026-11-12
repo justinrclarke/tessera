@@ -13,9 +13,10 @@ import (
 )
 
 type connection struct {
-	client  net.Conn
-	up      net.Conn
-	backend string
+	draining bool
+	client   net.Conn
+	up       net.Conn
+	backend  string
 }
 
 type Proxy struct {
@@ -40,6 +41,10 @@ func (p *Proxy) Set(name string, port int, backend string) error {
 }
 
 func (p *Proxy) SetBackends(name string, port int, backends []string) error {
+	return p.SetBackendsWithDrain(name, port, backends, 0)
+}
+
+func (p *Proxy) SetBackendsWithDrain(name string, port int, backends []string, drain time.Duration) error {
 	if port < 1 || port > 65535 {
 		return fmt.Errorf("route %s requires a port between 1 and 65535", name)
 	}
@@ -67,6 +72,17 @@ func (p *Proxy) SetBackends(name string, port int, backends []string) error {
 	p.backs[name] = backends
 	for c := range p.conns[port] {
 		if !contains(backends, c.backend) {
+			if drain > 0 {
+				if !c.draining {
+					c.draining = true
+					deadline := time.Now().Add(drain)
+					_ = c.client.SetDeadline(deadline)
+					if c.up != nil {
+						_ = c.up.SetDeadline(deadline)
+					}
+				}
+				continue
+			}
 			c.client.Close()
 			if c.up != nil {
 				c.up.Close()
@@ -196,6 +212,12 @@ func Backends(r api.Route, asgs []api.Assignment, nodes []api.Node) []string {
 			continue
 		}
 		port := asg.HostPort
+		if len(asg.HostPorts) > 0 && r.TargetPort != 0 {
+			port = asg.HostPorts[r.TargetPort]
+			if port == 0 {
+				continue
+			}
+		}
 		if port == 0 {
 			port = r.TargetPort
 		}

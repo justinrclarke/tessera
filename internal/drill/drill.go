@@ -33,6 +33,7 @@ func Run() ([]Report, error) {
 		fn   func() error
 	}{
 		{"place and run", placeAndRun},
+		{"unplaced models explain labels, GPU requirements, and recovery", placementDiagnostics},
 		{"dead node reschedules", deadNode},
 		{"bad release rolls back", rollback},
 		{"HTTP readiness preserves service through slow and failed updates", readinessRollout},
@@ -41,6 +42,8 @@ func Run() ([]Report, error) {
 		{"cache restores without a controller", restoreCache},
 		{"promote after leader loss", promote},
 		{"faster node gets the workload", moveFast},
+		{"checkpointed gang resumes saved progress after every old worker stops", checkpointGang},
+		{"scoped workers survive API token rotation without reading cluster secrets", scopedCredentials},
 		{"certificate renews at half life", renewCert},
 		{"route follows a move", routeFollowsMove},
 		{"cached image skips the registry", cachedImage},
@@ -739,6 +742,10 @@ func renewCert() error {
 }
 
 func boot(now time.Time) (*controller.Server, *client.Client, func()) {
+	return bootWithClock(func() time.Time { return now })
+}
+
+func bootWithClock(now func() time.Time) (*controller.Server, *client.Client, func()) {
 	dir := tDir()
 	st, err := store.Open(filepath.Join(dir, "tessera.db"))
 	if err != nil {
@@ -748,7 +755,7 @@ func boot(now time.Time) (*controller.Server, *client.Client, func()) {
 	if err != nil {
 		panic(err)
 	}
-	srv.Now = func() time.Time { return now }
+	srv.Now = now
 	ln, err := net.Listen("tcp", "127.0.0.1:0")
 	if err != nil {
 		panic(err)

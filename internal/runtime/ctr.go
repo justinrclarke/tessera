@@ -54,6 +54,14 @@ func (c *CTR) args(sub ...string) []string {
 }
 
 func (c *CTR) Start(ctx context.Context, spec Spec) (Container, error) {
+	if spec.Storage != nil {
+		return Container{}, &StartError{Reason: "persistent storage currently requires Docker"}
+	}
+	for _, port := range spec.Ports {
+		if port.Host != 0 && port.Host != port.Container {
+			return Container{}, &StartError{Reason: "ctr uses host networking and cannot remap container ports"}
+		}
+	}
 	if spec.GPUs > 0 {
 		return Container{}, &StartError{Reason: "GPU workloads require Docker with the NVIDIA Container Toolkit"}
 	}
@@ -75,6 +83,13 @@ func (c *CTR) Start(ctx context.Context, spec Spec) (Container, error) {
 	}
 	logPath := filepath.Join(c.LogDir, spec.Name+".log")
 	args := c.args("run", "-d", "--net-host", "--log-uri", "file://"+logPath)
+	if spec.CheckpointDirectory != "" {
+		info, err := os.Stat(spec.CheckpointDirectory)
+		if err != nil || !info.IsDir() {
+			return Container{}, &StartError{Reason: "shared checkpoint directory is not mounted"}
+		}
+		args = append(args, "--mount", "type=bind,src="+spec.CheckpointDirectory+",dst="+spec.CheckpointDirectory+",options=rbind:rw")
+	}
 	keys := make([]string, 0, len(spec.Env))
 	for k := range spec.Env {
 		keys = append(keys, k)
@@ -94,7 +109,11 @@ func (c *CTR) Start(ctx context.Context, spec Spec) (Container, error) {
 	if out, err := c.run(ctx, c.Bin, args...); err != nil {
 		return Container{}, &StartError{Reason: "ctr run: " + string(out)}
 	}
-	return Container{ID: spec.Name, Name: spec.Name, Running: true, HostPort: hostPort(spec)}, nil
+	ports := map[int]int{}
+	for _, p := range spec.Ports {
+		ports[p.Container] = p.Container
+	}
+	return Container{ID: spec.Name, Name: spec.Name, Running: true, HostPort: hostPort(spec), HostPorts: ports}, nil
 }
 
 func (c *CTR) Stop(ctx context.Context, id string) error {

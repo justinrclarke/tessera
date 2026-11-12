@@ -38,7 +38,11 @@ func (g *Gateway) Sync(ctx context.Context) error {
 	if state.Epoch < g.epoch {
 		return fmt.Errorf("gateway rejected stale controller epoch %d", state.Epoch)
 	}
-	if err := g.proxy.SetBackends(g.Route, g.Port, state.Backends); err != nil {
+	drain, err := time.ParseDuration(state.DrainTimeout)
+	if state.DrainTimeout != "" && (err != nil || drain <= 0 || drain > time.Hour) {
+		return fmt.Errorf("invalid route drain timeout")
+	}
+	if err := g.proxy.SetBackendsWithDrain(g.Route, g.Port, state.Backends, drain); err != nil {
 		return err
 	}
 	g.epoch = state.Epoch

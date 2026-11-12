@@ -12,6 +12,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"regexp"
 	"runtime"
 	"sort"
 	"strconv"
@@ -23,14 +24,26 @@ import (
 )
 
 type installOptions struct {
-	Data    string
-	BinDir  string
-	URL     string
-	Token   string
-	Runtime string
-	Labels  string
-	NoStart bool
-	Env     map[string]string
+	Name         string
+	Restricted   bool
+	Role         string
+	ID           string
+	Listen       string
+	RaftListen   string
+	Peers        string
+	Bootstrap    bool
+	AdvertiseURL string
+	Addr         string
+	Route        string
+	Port         int
+	Data         string
+	BinDir       string
+	URL          string
+	Token        string
+	Runtime      string
+	Labels       string
+	NoStart      bool
+	Env          map[string]string
 }
 
 type serviceRun func(string, ...string) error
@@ -42,6 +55,18 @@ func cmdInstall(args []string) error {
 	}
 	var opts installOptions
 	fs := flag.NewFlagSet("install", flag.ContinueOnError)
+	fs.StringVar(&opts.Role, "role", "agent", "agent, controller, or gateway")
+	fs.StringVar(&opts.Name, "name", "", "optional unique user-service name")
+	fs.BoolVar(&opts.Restricted, "restricted", false, "use scoped node credentials")
+	fs.StringVar(&opts.ID, "id", "", "stable controller ID")
+	fs.StringVar(&opts.Listen, "listen", ":7468", "controller HTTP listen address")
+	fs.StringVar(&opts.RaftListen, "raft-listen", "", "controller replication listen address")
+	fs.StringVar(&opts.Peers, "peers", "", "controller peer list")
+	fs.BoolVar(&opts.Bootstrap, "bootstrap", false, "bootstrap an empty replica store")
+	fs.StringVar(&opts.AdvertiseURL, "advertise-url", "", "reachable controller HTTP URL")
+	fs.StringVar(&opts.Addr, "addr", "", "reachable agent address")
+	fs.StringVar(&opts.Route, "route", "", "gateway Route name")
+	fs.IntVar(&opts.Port, "port", 8080, "gateway listen port")
 	fs.StringVar(&opts.Data, "data", config.Dir(), "cluster data directory")
 	fs.StringVar(&opts.BinDir, "bin-dir", filepath.Join(home, ".local", "bin"), "binary installation directory")
 	fs.StringVar(&opts.URL, "url", os.Getenv("TESSERA_URL"), "controller URL; discovered over mDNS if empty")
@@ -69,6 +94,38 @@ func cmdInstall(args []string) error {
 func installUser(goos, home, source string, uid int, opts installOptions, run serviceRun, out io.Writer) error {
 	if goos != "darwin" && goos != "linux" {
 		return fmt.Errorf("install is not implemented for %s", goos)
+	}
+	if opts.Role == "" {
+		opts.Role = "agent"
+	}
+	if opts.Role != "agent" && opts.Role != "controller" && opts.Role != "gateway" {
+		return fmt.Errorf("install role must be agent, controller, or gateway")
+	}
+	if opts.Name != "" && !regexp.MustCompile(`^tessera-[a-zA-Z0-9_-]+$`).MatchString(opts.Name) {
+		return fmt.Errorf("service name must start with tessera- and contain only letters, digits, underscores, or hyphens")
+	}
+	if opts.Role == "gateway" && (!regexp.MustCompile(`^[a-zA-Z0-9_-]+$`).MatchString(opts.Route) || opts.Port < 1 || opts.Port > 65535) {
+		return fmt.Errorf("gateway installation requires a simple Route name and valid port")
+	}
+	if opts.Role == "controller" {
+		if opts.Listen == "" {
+			opts.Listen = ":7468"
+		}
+		if opts.Peers != "" {
+			peers, err := parseControllerPeers(opts.Peers)
+			if err != nil {
+				return err
+			}
+			found := false
+			for _, p := range peers {
+				found = found || p.ID == opts.ID
+			}
+			if !found || opts.RaftListen == "" {
+				return fmt.Errorf("controller replicas require id and raft-listen")
+			}
+		} else if opts.AdvertiseURL == "" {
+			return fmt.Errorf("standalone controller installation requires advertise-url")
+		}
 	}
 	var err error
 	opts.Data, err = filepath.Abs(opts.Data)
@@ -120,7 +177,7 @@ func installUser(goos, home, source string, uid int, opts installOptions, run se
 		opts.Env = map[string]string{}
 	}
 	opts.Env["TESSERA_DATA"] = opts.Data
-	values := []string{home, bin, opts.Data, opts.URL, opts.Token, opts.Labels}
+	values := []string{home, bin, opts.Data, opts.URL, opts.Token, opts.Labels, opts.ID, opts.Listen, opts.RaftListen, opts.Peers, opts.AdvertiseURL, opts.Addr, opts.Route}
 	for _, v := range opts.Env {
 		values = append(values, v)
 	}
@@ -145,7 +202,19 @@ func installUser(goos, home, source string, uid int, opts installOptions, run se
 	if err := installFile(filepath.Join(opts.Data, "client.json"), bytes.NewReader(cfgBody), 0o600); err != nil {
 		return err
 	}
-	if err := installFile(filepath.Join(opts.Data, "token"), strings.NewReader(opts.Token+"\n"), 0o600); err != nil {
+	if _, err := os.Stat(filepath.Join(opts.Data, "token")); os.IsNotExist(err) {
+		_, databaseErr := os.Stat(filepath.Join(opts.Data, "tessera.db"))
+		if databaseErr != nil && !os.IsNotExist(databaseErr) {
+			return databaseErr
+		}
+		if opts.Role != "controller" || os.IsNotExist(databaseErr) {
+			if err := installFile(filepath.Join(opts.Data, "token"), strings.NewReader(opts.Token+"\n"), 0o600); err != nil {
+				return err
+			}
+		}
+	} else if err != nil {
+		return err
+	} else if err := os.Chmod(filepath.Join(opts.Data, "token"), 0o600); err != nil {
 		return err
 	}
 	if err := installFile(path, strings.NewReader(body), 0o644); err != nil {
@@ -159,7 +228,7 @@ func installUser(goos, home, source string, uid int, opts installOptions, run se
 	if err := startUserService(goos, path, uid, run); err != nil {
 		return fmt.Errorf("files installed, but service startup failed: %w", err)
 	}
-	fmt.Fprintln(out, "agent service started")
+	fmt.Fprintf(out, "%s service started\n", opts.Role)
 	return nil
 }
 
@@ -171,6 +240,41 @@ func userService(goos, home, bin string, opts installOptions) (string, string) {
 	if opts.Labels != "" {
 		args = append(args, "--labels", opts.Labels)
 	}
+	if opts.Addr != "" {
+		args = append(args, "--addr", opts.Addr)
+	}
+	if opts.Role == "agent" || opts.Role == "" {
+		if opts.ID != "" {
+			args = append(args, "--id", opts.ID)
+		}
+		if opts.Restricted {
+			args = append(args, "--restricted")
+		}
+	}
+	label, logName := "tessera", "agent"
+	if opts.Role == "controller" {
+		label, logName = "tessera-controller", "controller"
+		args = []string{bin, "controller", "--data", opts.Data, "--listen", opts.Listen}
+		if opts.ID != "" {
+			args = append(args, "--id", opts.ID)
+		}
+		if opts.Peers != "" {
+			args = append(args, "--peers", opts.Peers, "--raft-listen", opts.RaftListen)
+		}
+		if opts.Bootstrap {
+			args = append(args, "--bootstrap")
+		}
+		if opts.AdvertiseURL != "" {
+			args = append(args, "--advertise-url", opts.AdvertiseURL)
+		}
+	}
+	if opts.Role == "gateway" {
+		label, logName = "tessera-gateway-"+opts.Route, "gateway-"+opts.Route
+		args = []string{bin, "gateway", "--route", opts.Route, "--port", strconv.Itoa(opts.Port)}
+	}
+	if opts.Name != "" {
+		label = opts.Name
+	}
 	keys := make([]string, 0, len(opts.Env))
 	for key := range opts.Env {
 		keys = append(keys, key)
@@ -178,7 +282,7 @@ func userService(goos, home, bin string, opts installOptions) (string, string) {
 	sort.Strings(keys)
 	var b strings.Builder
 	if goos == "darwin" {
-		b.WriteString("<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n<plist version=\"1.0\"><dict>\n<key>Label</key><string>tessera</string>\n<key>ProgramArguments</key><array>")
+		b.WriteString("<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n<plist version=\"1.0\"><dict>\n<key>Label</key><string>" + label + "</string>\n<key>ProgramArguments</key><array>")
 		for _, arg := range args {
 			b.WriteString("<string>" + xmlText(arg) + "</string>")
 		}
@@ -187,11 +291,15 @@ func userService(goos, home, bin string, opts installOptions) (string, string) {
 			b.WriteString("<key>" + xmlText(key) + "</key><string>" + xmlText(opts.Env[key]) + "</string>")
 		}
 		b.WriteString("</dict>\n<key>RunAtLoad</key><true/>\n<key>KeepAlive</key><dict><key>SuccessfulExit</key><false/></dict>\n")
-		b.WriteString("<key>StandardOutPath</key><string>" + xmlText(filepath.Join(opts.Data, "agent.log")) + "</string>\n")
-		b.WriteString("<key>StandardErrorPath</key><string>" + xmlText(filepath.Join(opts.Data, "agent.log")) + "</string>\n</dict></plist>\n")
-		return filepath.Join(home, "Library", "LaunchAgents", "tessera.plist"), b.String()
+		b.WriteString("<key>StandardOutPath</key><string>" + xmlText(filepath.Join(opts.Data, logName+".log")) + "</string>\n")
+		b.WriteString("<key>StandardErrorPath</key><string>" + xmlText(filepath.Join(opts.Data, logName+".log")) + "</string>\n</dict></plist>\n")
+		return filepath.Join(home, "Library", "LaunchAgents", label+".plist"), b.String()
 	}
-	b.WriteString("[Unit]\nDescription=Tessera agent\n[Service]\nExecStart=")
+	role := opts.Role
+	if role == "" {
+		role = "agent"
+	}
+	b.WriteString("[Unit]\nDescription=Tessera " + role + "\n[Service]\nExecStart=")
 	for i, arg := range args {
 		if i > 0 {
 			b.WriteByte(' ')
@@ -203,13 +311,14 @@ func userService(goos, home, bin string, opts installOptions) (string, string) {
 		b.WriteString("Environment=" + systemdQuote(key+"="+opts.Env[key], false) + "\n")
 	}
 	b.WriteString("Restart=on-failure\nRestartSec=2\n[Install]\nWantedBy=default.target\n")
-	return filepath.Join(home, ".config", "systemd", "user", "tessera.service"), b.String()
+	return filepath.Join(home, ".config", "systemd", "user", label+".service"), b.String()
 }
 
 func startUserService(goos, path string, uid int, run serviceRun) error {
+	label := strings.TrimSuffix(filepath.Base(path), filepath.Ext(path))
 	if goos == "darwin" {
 		domain := fmt.Sprintf("gui/%d", uid)
-		service := domain + "/tessera"
+		service := domain + "/" + label
 		if run("launchctl", "print", service) == nil {
 			if err := run("launchctl", "bootout", service); err != nil {
 				return err
@@ -226,10 +335,10 @@ func startUserService(goos, path string, uid int, run serviceRun) error {
 	if err := run("systemctl", "--user", "daemon-reload"); err != nil {
 		return err
 	}
-	if err := run("systemctl", "--user", "enable", "tessera.service"); err != nil {
+	if err := run("systemctl", "--user", "enable", label+".service"); err != nil {
 		return err
 	}
-	return run("systemctl", "--user", "restart", "tessera.service")
+	return run("systemctl", "--user", "restart", label+".service")
 }
 
 func runService(name string, args ...string) error {

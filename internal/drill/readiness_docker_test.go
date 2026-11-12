@@ -53,7 +53,7 @@ func TestDockerReadinessRolloutSmoke(t *testing.T) {
 	}
 	ctx, cancel := context.WithTimeout(context.Background(), 40*time.Second)
 	defer cancel()
-	_, cl, cleanup := boot(time.Now())
+	_, cl, cleanup := bootWithClock(time.Now)
 	defer cleanup()
 	rtm := &ownedDocker{Docker: runtime.NewDocker(runtime.DockerSock()), names: map[string]bool{}}
 	if has, err := rtm.HasImage(ctx, "busybox:latest"); err != nil || !has {

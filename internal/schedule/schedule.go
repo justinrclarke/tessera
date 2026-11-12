@@ -1,13 +1,16 @@
 package schedule
 
 import (
+	"fmt"
 	"sort"
+	"strconv"
 	"time"
 
 	"tessera/internal/api"
 )
 
 type Placement struct {
+	Rank       int
 	App        string
 	NodeID     string
 	Generation int64
@@ -16,6 +19,7 @@ type Placement struct {
 }
 
 type Input struct {
+	Pinned      map[string]bool
 	Apps        []api.App
 	Nodes       []api.Node
 	Assignments []api.Assignment
@@ -28,8 +32,22 @@ type Input struct {
 }
 
 type Result struct {
-	Place []Placement
-	Stop  []string
+	Place   []Placement
+	Stop    []string
+	Blocked []Blocked
+}
+
+type Blocked struct {
+	App         string
+	Missing     int
+	Replacement bool
+	Reason      string
+	Nodes       []NodeFailure
+}
+
+type NodeFailure struct {
+	NodeID string
+	Reason string
 }
 
 func Plan(in Input) Result {
@@ -59,9 +77,21 @@ func Plan(in Input) Result {
 		if !api.Active(asg.Status) {
 			continue
 		}
+		if in.Pinned[asg.App] {
+			continue
+		}
+		if asg.Status == api.StatusDraining {
+			if !in.Now.Before(asg.StopAfter) {
+				stop[asg.ID] = true
+			}
+			continue
+		}
 		app, ok := apps[asg.App]
 		if !ok || app.Replicas == 0 {
 			stop[asg.ID] = true
+			continue
+		}
+		if asg.Storage != nil {
 			continue
 		}
 		n, has := nodes[asg.NodeID]
@@ -101,11 +131,13 @@ func Plan(in Input) Result {
 	load := map[string]int{}
 	usedPorts := map[string]map[int]bool{}
 	active := map[string][]api.Assignment{}
+	draining := map[string]bool{}
 	for _, asg := range in.Assignments {
-		if stop[asg.ID] || !api.Active(asg.Status) {
+		app := apps[asg.App]
+		willDrain := stop[asg.ID] && asg.Status == api.StatusRunning && app.DrainTimeout != ""
+		if stop[asg.ID] && !willDrain && asg.Storage == nil || !api.Active(asg.Status) {
 			continue
 		}
-		app := apps[asg.App]
 		used[asg.NodeID] = add(used[asg.NodeID], reqOf(app, asg))
 		gpuCount := asg.GPUs
 		if gpuCount == 0 {
@@ -121,8 +153,12 @@ func Plan(in Input) Result {
 			}
 		}
 		load[asg.NodeID]++
-		reservePorts(usedPorts, asg.NodeID, asg.Ports)
-		active[asg.App] = append(active[asg.App], asg)
+		reservePorts(usedPorts, asg.NodeID, publishedPorts(nodes[asg.NodeID], asg.Ports))
+		if asg.Status == api.StatusDraining || willDrain {
+			draining[asg.App] = true
+		} else {
+			active[asg.App] = append(active[asg.App], asg)
+		}
 	}
 
 	names := make([]string, 0, len(in.Apps))
@@ -134,6 +170,9 @@ func Plan(in Input) Result {
 	ready := readyNodes(in.Nodes)
 	for _, name := range names {
 		app := apps[name]
+		if in.Pinned[name] {
+			continue
+		}
 		if !depsReady(app, runningApps) {
 			continue
 		}
@@ -158,16 +197,18 @@ func Plan(in Input) Result {
 		}
 		if count < app.Replicas {
 			need := app.Replicas - count
+			placedCount := 0
 			if app.Gang {
 				placed, ok := gang(app, ready, cur, used, usedGPUs, usedDevices, usedPorts, load, need)
 				if ok {
+					placedCount = len(placed)
 					res.Place = append(res.Place, placed...)
 					for _, p := range placed {
 						used[p.NodeID] = add(used[p.NodeID], app.Resources)
 						usedGPUs[p.NodeID] += app.GPUs
 						reserveDevices(usedDevices, p.NodeID, p.GPUDevices)
 						load[p.NodeID]++
-						reservePorts(usedPorts, p.NodeID, app.Ports)
+						reservePorts(usedPorts, p.NodeID, publishedPorts(nodes[p.NodeID], app.Ports))
 					}
 				}
 			} else {
@@ -178,12 +219,23 @@ func Plan(in Input) Result {
 					}
 					ids, _ := selectGPUDevices(n, app, usedGPUs[n.ID], usedDevices[n.ID])
 					res.Place = append(res.Place, Placement{App: app.Name, NodeID: n.ID, Generation: app.Generation, GPUDevices: ids})
+					placedCount++
 					used[n.ID] = add(used[n.ID], app.Resources)
 					usedGPUs[n.ID] += app.GPUs
 					reserveDevices(usedDevices, n.ID, ids)
 					load[n.ID]++
-					reservePorts(usedPorts, n.ID, app.Ports)
+					reservePorts(usedPorts, n.ID, publishedPorts(n, app.Ports))
 				}
+			}
+			if placedCount < need {
+				reason := "no node can fit the remaining replicas"
+				if app.Gang {
+					reason = fmt.Sprintf("gang needs all %d remaining workers to fit together", need)
+					if app.GangFabric != "" {
+						reason += " with one shared value of gang fabric label " + app.GangFabric
+					}
+				}
+				res.Blocked = append(res.Blocked, placementBlocked(app, need-placedCount, reason, in.Nodes, cur, used, usedGPUs, usedDevices, usedPorts))
 			}
 		}
 		if count > app.Replicas {
@@ -227,7 +279,7 @@ func Plan(in Input) Result {
 				stale = true
 			}
 		}
-		if stale && extra == 0 && count == app.Replicas && app.Kind != api.KindJob {
+		if stale && extra == 0 && count == app.Replicas && app.Kind != api.KindJob && app.Storage == nil && !draining[name] {
 			sort.Slice(cur, func(i, j int) bool { return cur[i].ID < cur[j].ID })
 			for _, old := range cur {
 				if old.Generation == app.Generation {
@@ -239,20 +291,24 @@ func Plan(in Input) Result {
 					used[n.ID] = add(used[n.ID], app.Resources)
 					usedGPUs[n.ID] += app.GPUs
 					reserveDevices(usedDevices, n.ID, ids)
-					reservePorts(usedPorts, n.ID, app.Ports)
+					reservePorts(usedPorts, n.ID, publishedPorts(n, app.Ports))
 					load[n.ID]++
+				} else {
+					blocked := placementBlocked(app, 1, "rollout needs spare capacity while the previous generation stays running", in.Nodes, cur, used, usedGPUs, usedDevices, usedPorts)
+					blocked.Replacement = true
+					res.Blocked = append(res.Blocked, blocked)
 				}
 				break
 			}
 		}
-		if !stale && in.AllowMove && count == app.Replicas {
+		if !stale && in.AllowMove && count == app.Replicas && !draining[name] {
 			if mv, ok := move(app, cur, ready, used, usedGPUs, usedDevices, usedPorts, load, in); ok {
 				res.Place = append(res.Place, mv)
 				used[mv.NodeID] = add(used[mv.NodeID], app.Resources)
 				usedGPUs[mv.NodeID] += app.GPUs
 				reserveDevices(usedDevices, mv.NodeID, mv.GPUDevices)
 				load[mv.NodeID]++
-				reservePorts(usedPorts, mv.NodeID, app.Ports)
+				reservePorts(usedPorts, mv.NodeID, publishedPorts(nodes[mv.NodeID], app.Ports))
 			}
 		}
 	}
@@ -261,7 +317,7 @@ func Plan(in Input) Result {
 }
 
 func move(app api.App, cur []api.Assignment, ready []api.Node, used map[string]api.Resources, usedGPUs map[string]int, usedDevices map[string]map[string]bool, usedPorts map[string]map[int]bool, load map[string]int, in Input) (Placement, bool) {
-	if app.Kind == api.KindJob {
+	if app.Kind == api.KindJob || app.Storage != nil {
 		return Placement{}, false
 	}
 	if !in.LastMove[app.Name].IsZero() && in.Now.Sub(in.LastMove[app.Name]) < in.Cooldown {
@@ -335,8 +391,27 @@ func Gain(candidate, current api.Perf, sensitive string) float64 {
 }
 
 func gang(app api.App, ready []api.Node, active []api.Assignment, used map[string]api.Resources, usedGPUs map[string]int, usedDevices map[string]map[string]bool, usedPorts map[string]map[int]bool, load map[string]int, need int) ([]Placement, bool) {
+	ranks := func(placed []Placement, ok bool) ([]Placement, bool) {
+		taken := map[int]bool{}
+		for _, a := range active {
+			rank, err := strconv.Atoi(a.Env["TESSERA_WORKER_RANK"])
+			if err == nil {
+				taken[rank] = true
+			}
+		}
+		for i := range placed {
+			for rank := 0; rank < app.Replicas; rank++ {
+				if !taken[rank] {
+					placed[i].Rank = rank
+					taken[rank] = true
+					break
+				}
+			}
+		}
+		return placed, ok
+	}
 	if app.GangFabric == "" {
-		return gangOnNodes(app, ready, used, usedGPUs, usedDevices, usedPorts, load, need)
+		return ranks(gangOnNodes(app, ready, used, usedGPUs, usedDevices, usedPorts, load, need))
 	}
 	groups := map[string][]api.Node{}
 	byID := map[string]api.Node{}
@@ -366,7 +441,7 @@ func gang(app api.App, ready []api.Node, active []api.Assignment, used map[strin
 	sort.Strings(fabrics)
 	for _, fabric := range fabrics {
 		if placed, ok := gangOnNodes(app, groups[fabric], used, usedGPUs, usedDevices, usedPorts, load, need); ok {
-			return placed, true
+			return ranks(placed, true)
 		}
 	}
 	return nil, false
@@ -399,7 +474,7 @@ func gangOnNodes(app api.App, ready []api.Node, used map[string]api.Resources, u
 		g[n.ID] += app.GPUs
 		reserveDevices(idsUsed, n.ID, ids)
 		l[n.ID]++
-		reservePorts(portsUsed, n.ID, app.Ports)
+		reservePorts(portsUsed, n.ID, publishedPorts(n, app.Ports))
 	}
 	return out, true
 }
@@ -408,13 +483,7 @@ func pick(nodes []api.Node, used map[string]api.Resources, usedGPUs map[string]i
 	var best api.Node
 	found := false
 	for _, n := range nodes {
-		if n.Status != api.NodeReady {
-			continue
-		}
-		if portsConflict(usedPorts[n.ID], app.Ports) {
-			continue
-		}
-		if !fits(n, used[n.ID], usedGPUs[n.ID], usedDevices[n.ID], app) {
+		if placementFailure(n, used[n.ID], usedGPUs[n.ID], usedDevices[n.ID], usedPorts[n.ID], app) != "" {
 			continue
 		}
 		if !found || better(n, load[n.ID], best, load[best.ID], app) {
@@ -465,31 +534,71 @@ func rank(n api.Node, app api.App) float64 {
 	return n.Score
 }
 
-func fits(n api.Node, used api.Resources, usedGPUs int, usedDevices map[string]bool, app api.App) bool {
-	for key, value := range app.NodeLabels {
-		if n.Labels[key] != value {
-			return false
+func placementFailure(n api.Node, used api.Resources, usedGPUs int, usedDevices map[string]bool, usedPorts map[int]bool, app api.App) string {
+	if app.Storage != nil {
+		if n.ID != app.Storage.Node {
+			return "persistent storage is pinned to node " + app.Storage.Node
 		}
+		if !n.StorageCapable {
+			return "node does not support persistent storage; upgrade its agent and use Docker"
+		}
+	}
+	if n.Status != api.NodeReady {
+		return fmt.Sprintf("node is %s; placement requires ready", n.Status)
+	}
+	if n.Runtime == "ctr" {
+		if app.GPUs > 0 {
+			return "GPU workloads require Docker; this node uses ctr"
+		}
+		for _, p := range app.Ports {
+			if p.Host != 0 && p.Host != p.Container {
+				return "ctr host networking cannot remap container ports"
+			}
+		}
+	}
+	for _, port := range publishedPorts(n, app.Ports) {
+		if port.Host != 0 && usedPorts[port.Host] {
+			return fmt.Sprintf("host port %d is already reserved", port.Host)
+		}
+	}
+	label := ""
+	for key, value := range app.NodeLabels {
+		if n.Labels[key] != value && (label == "" || key < label) {
+			label = key
+		}
+	}
+	if label != "" {
+		return fmt.Sprintf("requires node label %s=%s (reported %q)", label, app.NodeLabels[label], n.Labels[label])
 	}
 	need := app.Resources
 	if need.CPU > 0 && n.Capacity.CPU > 0 && used.CPU+need.CPU > n.Capacity.CPU {
-		return false
+		return fmt.Sprintf("needs %dm CPU; %dm available after reservations", need.CPU, max(int64(0), n.Capacity.CPU-used.CPU))
 	}
 	if need.Memory > 0 && n.Capacity.Memory > 0 && used.Memory+need.Memory > n.Capacity.Memory {
-		return false
+		return fmt.Sprintf("needs %d bytes memory; %d available after reservations", need.Memory, max(int64(0), n.Capacity.Memory-used.Memory))
 	}
 	if app.GPUs > 0 && usedGPUs+app.GPUs > n.GPUs {
-		return false
+		return fmt.Sprintf("needs %d GPUs; %d available after reservations", app.GPUs, max(0, n.GPUs-usedGPUs))
 	}
 	if app.GPUs > 0 && (len(n.GPUInventory) > 0 || app.GPUModel != "" || app.GPUMemory > 0) {
 		if _, ok := selectGPUDevices(n, app, usedGPUs, usedDevices); !ok {
-			return false
+			if len(n.GPUInventory) == 0 {
+				return "GPU inventory is unavailable; model and memory constraints require device inventory"
+			}
+			reason := fmt.Sprintf("needs %d unreserved GPU devices", app.GPUs)
+			if app.GPUModel != "" {
+				reason += fmt.Sprintf(" of model %q", app.GPUModel)
+			}
+			if app.GPUMemory > 0 {
+				reason += fmt.Sprintf(" with at least %d bytes free memory per device", app.GPUMemory)
+			}
+			return reason
 		}
 	}
 	if need.Memory > 0 && n.Free.Memory > 0 && need.Memory > n.Free.Memory {
-		return false
+		return fmt.Sprintf("needs %d bytes memory; node reports %d free", need.Memory, n.Free.Memory)
 	}
-	return true
+	return ""
 }
 
 func selectGPUDevices(n api.Node, app api.App, usedCount int, reserved map[string]bool) ([]string, bool) {
@@ -593,15 +702,6 @@ func nodeByID(nodes []api.Node, id string) (api.Node, bool) {
 		}
 	}
 	return api.Node{}, false
-}
-
-func portsConflict(used map[int]bool, ports []api.Port) bool {
-	for _, p := range ports {
-		if p.Host != 0 && used[p.Host] {
-			return true
-		}
-	}
-	return false
 }
 
 func reservePorts(used map[string]map[int]bool, node string, ports []api.Port) {

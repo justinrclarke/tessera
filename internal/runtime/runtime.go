@@ -9,24 +9,29 @@ import (
 )
 
 type Spec struct {
-	Name       string
-	Image      string
-	Command    []string
-	Env        map[string]string
-	Ports      []api.Port
-	Resources  api.Resources
-	GPUs       int
-	GPUDevices []string
+	Storage             *api.Storage
+	Owner               string
+	CheckpointDirectory string
+	Name                string
+	Image               string
+	Command             []string
+	Env                 map[string]string
+	Ports               []api.Port
+	Resources           api.Resources
+	GPUs                int
+	GPUDevices          []string
 }
 
 type Container struct {
-	ID       string
-	Name     string
-	Running  bool
-	ExitCode int
-	Reason   string
-	OOM      bool
-	HostPort int
+	Owner     string
+	HostPorts map[int]int
+	ID        string
+	Name      string
+	Running   bool
+	ExitCode  int
+	Reason    string
+	OOM       bool
+	HostPort  int
 }
 
 type Runtime interface {

@@ -26,6 +26,8 @@ import (
 )
 
 type Agent struct {
+	LockDir     string
+	Restricted  bool
 	ID          string
 	DataDir     string
 	Token       string
@@ -56,22 +58,29 @@ type Agent struct {
 }
 
 type diskCache struct {
-	Controllers []string              `json:"controllers,omitempty"`
-	NodeID      string                `json:"node_id"`
-	Assignments []api.Assignment      `json:"assignments"`
-	Snapshot    api.Snapshot          `json:"snapshot"`
-	SnapBody    string                `json:"snap_body"`
-	Sig         string                `json:"sig"`
-	Epoch       uint64                `json:"epoch"`
-	Perf        api.Perf              `json:"perf,omitempty"`
-	PerfAt      time.Time             `json:"perf_at,omitempty"`
-	Probes      map[string]probeState `json:"probes,omitempty"`
+	FormatVersion int                   `json:"format_version,omitempty"`
+	NodeToken     string                `json:"node_token,omitempty"`
+	Controllers   []string              `json:"controllers,omitempty"`
+	NodeID        string                `json:"node_id"`
+	Assignments   []api.Assignment      `json:"assignments"`
+	Snapshot      api.Snapshot          `json:"snapshot"`
+	SnapBody      string                `json:"snap_body"`
+	Sig           string                `json:"sig"`
+	Epoch         uint64                `json:"epoch"`
+	Perf          api.Perf              `json:"perf,omitempty"`
+	PerfAt        time.Time             `json:"perf_at,omitempty"`
+	Probes        map[string]probeState `json:"probes,omitempty"`
 }
 
 var ErrHalted = errors.New("halted")
 
 func (a *Agent) Run(ctx context.Context) error {
 	a.init()
+	unlock, err := a.acquireRuntimeLock(ctx)
+	if err != nil {
+		return err
+	}
+	defer unlock()
 	if err := a.restore(ctx); err != nil {
 		return err
 	}
@@ -153,7 +162,7 @@ func (a *Agent) Tick(ctx context.Context) error {
 	if hb.CertPEM != "" {
 		_ = a.saveCert(hb.CertPEM, hb.KeyPEM)
 	}
-	if hb.SnapshotIndex > a.snapIndex || hb.Epoch > a.snapEpoch {
+	if !a.Restricted && (hb.SnapshotIndex > a.snapIndex || hb.Epoch > a.snapEpoch) {
 		_ = a.fetchSnapshot(ctx)
 	}
 	page, err := a.Client.WaitAssignments(ctx, a.ID, a.rev, 0)
@@ -205,6 +214,12 @@ func (a *Agent) ConvergeForTest(ctx context.Context, desired []api.Assignment, l
 
 func (a *Agent) maybePromote(ctx context.Context) (bool, error) {
 	a.init()
+	if a.Restricted {
+		return false, nil
+	}
+	if c, err := a.readCache(); err == nil && c.NodeToken != "" {
+		return false, nil
+	}
 	if a.promoted != nil {
 		return true, nil
 	}
@@ -289,6 +304,10 @@ func (a *Agent) restore(ctx context.Context) error {
 	}
 	if a.Client != nil {
 		a.Client.SetControllers(c.Controllers)
+		if c.NodeToken != "" {
+			a.Client = a.clientWithToken(c.NodeToken)
+			a.Restricted = true
+		}
 	}
 	if c.Snapshot.Index > 0 {
 		a.snapIndex = c.Snapshot.Index
@@ -304,7 +323,15 @@ func (a *Agent) converge(ctx context.Context, desired []api.Assignment, live boo
 	if a.Runtime == nil {
 		return a.saveCache(desired)
 	}
-	have, err := a.Runtime.List(ctx)
+	owned := append([]api.Assignment(nil), desired...)
+	if cache, err := a.readCache(); err == nil {
+		owned = append(owned, cache.Assignments...)
+	}
+	rtm := a.Runtime
+	if a.runtimeKind() == "docker" || a.runtimeKind() == "fake" {
+		rtm = runtime.ForOwner(a.Runtime, a.ID, owned)
+	}
+	have, err := rtm.List(ctx)
 	if err != nil {
 		return err
 	}
@@ -327,6 +354,39 @@ func (a *Agent) converge(ctx context.Context, desired []api.Assignment, live boo
 		want[d.ID] = true
 		keep = append(keep, d)
 		c, ok := byName[name]
+		if _, ctr := a.Runtime.(*runtime.CTR); ctr && ok {
+			c.HostPorts = map[int]int{}
+			for _, port := range d.Ports {
+				c.HostPorts[port.Container] = port.Container
+			}
+			if len(d.Ports) > 0 {
+				c.HostPort = d.Ports[0].Container
+			}
+		}
+		if d.Status == api.StatusDraining {
+			if a.now().Before(d.StopAfter) {
+				continue
+			}
+			if ok {
+				if err := a.Runtime.Stop(ctx, c.ID); err != nil {
+					return err
+				}
+			}
+			a.report(ctx, d, api.StatusStopped, "drain timeout elapsed", c)
+			continue
+		}
+		if d.Status == api.StatusReserved {
+			continue
+		}
+		if d.Status == api.StatusStopping {
+			if ok {
+				if err := a.Runtime.Stop(ctx, c.ID); err != nil {
+					return err
+				}
+			}
+			a.report(ctx, d, api.StatusStopped, "checkpoint worker stopped", c)
+			continue
+		}
 		if ok && c.Running {
 			a.reportReady(ctx, d, c)
 			continue
@@ -348,14 +408,16 @@ func (a *Agent) converge(ctx context.Context, desired []api.Assignment, live boo
 				a.report(ctx, d, api.StatusFailed, reason, c)
 				continue
 			}
-			if err := a.Runtime.Stop(ctx, c.ID); err != nil {
+			if err := rtm.Stop(ctx, c.ID); err != nil {
 				a.report(ctx, d, api.StatusFailed, err.Error(), c)
 				continue
 			}
 		}
 		a.ensureImage(ctx, d.Image)
-		started, err := a.Runtime.Start(ctx, runtime.Spec{
-			Name: name, Image: d.Image, Command: d.Command, Env: d.Env, Ports: d.Ports, Resources: d.Resources, GPUs: d.GPUs, GPUDevices: d.GPUDevices,
+		started, err := rtm.Start(ctx, runtime.Spec{
+			Storage:             d.Storage,
+			CheckpointDirectory: d.CheckpointDirectory,
+			Name:                name, Image: d.Image, Command: d.Command, Env: d.Env, Ports: d.Ports, Resources: d.Resources, GPUs: d.GPUs, GPUDevices: d.GPUDevices,
 		})
 		if err != nil {
 			reason := err.Error()
@@ -390,7 +452,9 @@ func (a *Agent) converge(ctx context.Context, desired []api.Assignment, live boo
 		for name, c := range byName {
 			id := strings.TrimPrefix(name, "tessera_")
 			if !want[id] {
-				_ = a.Runtime.Stop(ctx, c.ID)
+				if err := rtm.Stop(ctx, c.ID); err != nil {
+					return err
+				}
 			}
 		}
 	}
@@ -410,7 +474,13 @@ func (a *Agent) report(ctx context.Context, d api.Assignment, status, reason str
 	if c.ID != "" && a.Runtime != nil {
 		logs, _ = a.Runtime.Logs(ctx, c.ID)
 	}
+	done, progress := "", int64(0)
+	if marker := a.checkpointMarker(d); marker != nil {
+		done, progress = marker.RequestID, marker.Progress
+	}
 	_ = a.Client.Report(ctx, d.ID, client.StatusReport{
+		HostPorts:      c.HostPorts,
+		CheckpointDone: done, CheckpointProgress: progress,
 		Epoch:  d.Epoch,
 		Status: status, Reason: reason, Restarts: a.restarts[d.ID], RuntimeID: c.ID, HostPort: c.HostPort, Logs: logs,
 	})
@@ -426,9 +496,38 @@ func (a *Agent) ensureRegistered(ctx context.Context) error {
 		}
 	}
 	items := a.gpuInventory()
-	_, err := a.Client.Register(ctx, client.RegisterRequest{
-		ID: a.ID, Addr: a.addr(), Capacity: a.capacity(), Free: a.free(), Perf: a.perf(), GPUs: len(items), GPUInventory: items, DiskFree: a.diskFree(), DiskTotal: a.diskTotal(), Labels: a.Labels,
-	})
+	if cache, err := a.readCache(); err == nil && cache.NodeToken != "" {
+		if a.Client.Token != cache.NodeToken {
+			a.Client = a.clientWithToken(cache.NodeToken)
+		}
+		a.Restricted = true
+	}
+	request := client.RegisterRequest{
+		StorageCapable: a.runtimeKind() == "docker" || a.runtimeKind() == "fake",
+		Restricted:     a.Restricted,
+		Runtime:        a.runtimeKind(),
+		ID:             a.ID, Addr: a.addr(), Capacity: a.capacity(), Free: a.free(), Perf: a.perf(), GPUs: len(items), GPUInventory: items, DiskFree: a.diskFree(), DiskTotal: a.diskTotal(), Labels: a.Labels,
+	}
+	response, err := a.Client.Register(ctx, request)
+	var authError *client.HTTPError
+	if errors.As(err, &authError) && authError.Status == 401 && strings.HasPrefix(a.Token, "tessera-join.") {
+		a.Client = a.clientWithToken(a.Token)
+		response, err = a.Client.Register(ctx, request)
+	}
+	if err == nil && response.NodeToken != "" {
+		cache, readErr := a.readCache()
+		if readErr != nil && !os.IsNotExist(readErr) {
+			return readErr
+		}
+		cache.NodeID, cache.NodeToken = a.ID, response.NodeToken
+		cache.Snapshot = api.Snapshot{}
+		cache.SnapBody, cache.Sig = "", ""
+		if err := a.writeCache(cache); err != nil {
+			return err
+		}
+		a.Client = a.clientWithToken(response.NodeToken)
+		a.Restricted = true
+	}
 	return err
 }
 
@@ -445,6 +544,9 @@ func (a *Agent) fetchSnapshot(ctx context.Context) error {
 	}
 	if err := json.Unmarshal([]byte(signed.Body), &signed.Snapshot); err != nil {
 		return err
+	}
+	if signed.Snapshot.FormatVersion < 0 || signed.Snapshot.FormatVersion > api.StateVersion {
+		return fmt.Errorf("unsupported snapshot format %d", signed.Snapshot.FormatVersion)
 	}
 	if !survive.AcceptAssignment(a.maxEpoch, signed.Snapshot.Epoch) || (signed.Snapshot.Epoch == a.snapEpoch && signed.Snapshot.Index < a.snapIndex) {
 		return fmt.Errorf("stale snapshot")
@@ -512,10 +614,14 @@ func (a *Agent) readCache() (diskCache, error) {
 		return c, err
 	}
 	err = json.Unmarshal(b, &c)
+	if err == nil && (c.FormatVersion < 0 || c.FormatVersion > api.StateVersion || c.Snapshot.FormatVersion < 0 || c.Snapshot.FormatVersion > api.StateVersion) {
+		return c, fmt.Errorf("agent cache requires a different Tessera version")
+	}
 	return c, err
 }
 
 func (a *Agent) writeCache(c diskCache) error {
+	c.FormatVersion = api.StateVersion
 	b, err := json.MarshalIndent(c, "", "  ")
 	if err != nil {
 		return err
@@ -577,7 +683,8 @@ func (a *Agent) reportHost() client.HeartbeatRequest {
 	cap, free, diskTotal, diskFree := host.Resources(a.DataDir)
 	items := a.gpuInventory()
 	return client.HeartbeatRequest{
-		Addr: a.addr(), Capacity: cap, Free: free, Perf: a.perf(), GPUs: len(items), GPUInventory: items, DiskFree: diskFree, DiskTotal: diskTotal,
+		Runtime: a.runtimeKind(),
+		Addr:    a.addr(), Capacity: cap, Free: free, Perf: a.perf(), GPUs: len(items), GPUInventory: items, DiskFree: diskFree, DiskTotal: diskTotal,
 	}
 }
 
@@ -671,6 +778,9 @@ func (a *Agent) ensureImage(ctx context.Context, ref string) {
 }
 
 func (a *Agent) publishImage(ctx context.Context, ref string) {
+	if a.Restricted {
+		return
+	}
 	if a.Client == nil || a.Runtime == nil || ref == "" {
 		return
 	}
@@ -730,14 +840,19 @@ func (a *Agent) finish(ctx context.Context, id string, err error) error {
 }
 
 func (a *Agent) clearLocal(ctx context.Context, keepID bool) error {
+	cache, _ := a.readCache()
 	if a.Runtime != nil {
-		items, err := a.Runtime.List(ctx)
+		rtm := a.Runtime
+		if a.runtimeKind() == "docker" || a.runtimeKind() == "fake" {
+			rtm = runtime.ForOwner(a.Runtime, a.ID, cache.Assignments)
+		}
+		items, err := rtm.List(ctx)
 		if err != nil {
 			return err
 		}
 		for _, c := range items {
 			if strings.HasPrefix(c.Name, "tessera_") || strings.HasPrefix(c.ID, "tessera_") {
-				if err := a.Runtime.Stop(ctx, c.ID); err != nil {
+				if err := rtm.Stop(ctx, c.ID); err != nil {
 					return err
 				}
 			}
@@ -758,7 +873,7 @@ func (a *Agent) clearLocal(ctx context.Context, keepID bool) error {
 		}
 	}
 	if keepID && a.ID != "" {
-		return a.writeCache(diskCache{NodeID: a.ID, Epoch: a.maxEpoch})
+		return a.writeCache(diskCache{NodeID: a.ID, Epoch: a.maxEpoch, NodeToken: cache.NodeToken})
 	}
 	return nil
 }

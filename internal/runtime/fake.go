@@ -41,7 +41,7 @@ func (f *Fake) Start(ctx context.Context, spec Spec) (Container, error) {
 			f.images[spec.Image] = []byte(spec.Image)
 		}
 	}
-	c := Container{ID: spec.Name, Name: spec.Name, Running: true, HostPort: 18080}
+	c := Container{ID: spec.Name, Name: spec.Name, Running: true, HostPort: 18080, Owner: spec.Owner}
 	if len(spec.Ports) > 0 && spec.Ports[0].Host != 0 {
 		c.HostPort = spec.Ports[0].Host
 	}

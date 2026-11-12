@@ -98,11 +98,23 @@ func Prepare(ctx context.Context, manifestPath string, body []byte, run Run) ([]
 	}
 	var images []string
 	for _, build := range builds {
+		source, err := build.spec.contextDigest(manifestPath)
+		if err != nil {
+			return nil, nil, err
+		}
 		image, err := build.spec.Build(ctx, manifestPath, run)
 		if err != nil {
 			return nil, nil, err
 		}
+		after, err := build.spec.contextDigest(manifestPath)
+		if err != nil {
+			return nil, nil, err
+		}
+		if after != source {
+			return nil, nil, fmt.Errorf("build context changed while building %v; retry from a stable source directory", docs[build.index]["name"])
+		}
 		docs[build.index]["image"] = image
+		docs[build.index]["artifact"] = api.BuildRecord{Image: image, Base: build.spec.Base, PackageManager: build.spec.PackageManager, Packages: build.spec.Packages, Command: build.spec.Command, ContextDigest: source}
 		images = append(images, image)
 	}
 	out, err := encodeDocs(docs)
@@ -219,7 +231,7 @@ func (s Spec) Dockerfile() string {
 			fmt.Fprintf(&out, "RUN apt-get update && apt-get install -y --no-install-recommends %s && rm -rf /var/lib/apt/lists/*\n", strings.Join(s.Packages, " "))
 		}
 	}
-	out.WriteString("WORKDIR /app\nCOPY . .\n")
+	out.WriteString("WORKDIR /app\nCOPY . .\nENTRYPOINT []\n")
 	command, _ := json.Marshal(s.Command)
 	fmt.Fprintf(&out, "CMD %s\n", command)
 	return out.String()

@@ -1,8 +1,8 @@
 package controller
 
 import (
-	"crypto/subtle"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
@@ -22,18 +22,7 @@ import (
 )
 
 func (s *Server) auth(next http.Handler) http.Handler {
-	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		if r.URL.Path == "/v1/health" {
-			next.ServeHTTP(w, r)
-			return
-		}
-		got := strings.TrimPrefix(r.Header.Get("Authorization"), "Bearer ")
-		if subtle.ConstantTimeCompare([]byte(got), []byte(s.Token)) != 1 {
-			http.Error(w, "unauthorized", http.StatusUnauthorized)
-			return
-		}
-		next.ServeHTTP(w, r)
-	})
+	return s.authorize(next)
 }
 
 func (s *Server) handleHealth(w http.ResponseWriter, r *http.Request) {
@@ -117,7 +106,7 @@ func (s *Server) applyObjects(objs []api.Object) ([]string, error) {
 				return nil, err
 			}
 			obj.App.ReleaseEnv, obj.App.EnvResolved = env, true
-			if err := s.Store.PutApp(*obj.App); err != nil {
+			if err := s.putApp(*obj.App); err != nil {
 				return nil, err
 			}
 			applied = append(applied, obj.App.Kind+"/"+obj.App.Name)
@@ -161,12 +150,12 @@ func (s *Server) applyObjects(objs []api.Object) ([]string, error) {
 				return nil, err
 			}
 			app.ReleaseEnv, app.EnvResolved = env, true
-			if err := s.Store.PutApp(app); err != nil {
+			if err := s.putApp(app); err != nil {
 				return nil, err
 			}
 		}
 	}
-	return applied, nil
+	return applied, s.validateStorage()
 }
 
 func (s *Server) handleListApps(w http.ResponseWriter, r *http.Request) {
@@ -250,6 +239,27 @@ func (s *Server) handleRegister(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "bad register", http.StatusBadRequest)
 		return
 	}
+	claim := r.Header.Get("X-Tessera-Node")
+	join := r.Header.Get("X-Tessera-Join")
+	if (claim != "" && claim != req.ID) || (join != "" && join != req.ID) {
+		http.Error(w, "node credential does not match registration", 403)
+		return
+	}
+	if claim != "" || join != "" {
+		req.Restricted = true
+	}
+	if req.Restricted && !scopedNodeID.MatchString(req.ID) {
+		http.Error(w, "scoped nodes require an alphanumeric node ID with hyphens or underscores", 400)
+		return
+	}
+	nodeToken := ""
+	if req.Restricted && claim == "" {
+		nodeToken = "tessera-node." + req.ID + "." + api.NewID() + api.NewID() + api.NewID() + api.NewID()
+		if err := s.Store.SetMeta("auth:node:"+req.ID, tokenHash(nodeToken)); err != nil {
+			http.Error(w, err.Error(), 500)
+			return
+		}
+	}
 	now := s.now()
 	cert, err := pki.Issue(s.ca, req.ID, now, 24*time.Hour)
 	if err != nil {
@@ -257,10 +267,20 @@ func (s *Server) handleRegister(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	n := api.Node{
-		ID: req.ID, Addr: req.Addr, Status: api.NodeReady,
+		StorageCapable: req.StorageCapable,
+		Restricted:     req.Restricted,
+		Runtime:        req.Runtime,
+		ID:             req.ID, Addr: req.Addr, Status: api.NodeReady,
 		Capacity: req.Capacity, Free: req.Free, Perf: req.Perf, Score: req.Perf.CPU, GPUs: req.GPUs, GPUInventory: req.GPUInventory,
 		Labels: req.Labels, LastSeen: now, DiskFree: req.DiskFree, DiskTotal: req.DiskTotal,
 		CertNotBefore: cert.NotBefore, CertNotAfter: cert.NotAfter, Epoch: s.Epoch(),
+	}
+	if state, err := readInfra(s.Store); err == nil {
+		for _, m := range state.State.Machines {
+			if m.NodeID == n.ID {
+				n.Cloud = &api.CloudIdentity{Provider: m.Machine.Provider, ID: m.Resource.ID, Region: m.Machine.Region, Owned: m.Owned, Owner: state.Owner}
+			}
+		}
 	}
 	s.mu.Lock()
 	if previous, err := s.Store.GetNode(req.ID); err == nil && previous.Status == api.NodeCordoned {
@@ -275,7 +295,8 @@ func (s *Server) handleRegister(w http.ResponseWriter, r *http.Request) {
 	s.mu.Unlock()
 	_ = s.Reconcile(now)
 	writeJSON(w, http.StatusOK, client.RegisterResponse{
-		CertPEM: string(cert.CertPEM), KeyPEM: string(cert.KeyPEM), CAPem: string(s.ca.CertPEM),
+		NodeToken: nodeToken,
+		CertPEM:   string(cert.CertPEM), KeyPEM: string(cert.KeyPEM), CAPem: string(s.ca.CertPEM),
 		NotBefore: cert.NotBefore, NotAfter: cert.NotAfter, Epoch: s.Epoch(),
 	})
 }
@@ -306,6 +327,9 @@ func (s *Server) handleHeartbeat(w http.ResponseWriter, r *http.Request) {
 		n.Capacity = req.Capacity
 	}
 	n.Free = req.Free
+	if req.Runtime != "" {
+		n.Runtime = req.Runtime
+	}
 	n.Perf = req.Perf
 	n.Score = req.Perf.CPU
 	n.GPUs = req.GPUs
@@ -334,6 +358,9 @@ func (s *Server) handleHeartbeat(w http.ResponseWriter, r *http.Request) {
 	}
 	if snap, _, err := s.Store.LatestSnapshot(); err == nil {
 		resp.SnapshotIndex = snap.Index
+	}
+	if n.Restricted {
+		resp.SnapshotIndex = 0
 	}
 	resp.Command = s.pendingCommandLocked(id)
 	s.mu.Unlock()
@@ -441,17 +468,27 @@ func (s *Server) handleStatus(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	switch rep.Status {
-	case api.StatusPending, api.StatusStarting, api.StatusRunning, api.StatusFailed, api.StatusSucceeded:
+	case api.StatusPending, api.StatusStarting, api.StatusRunning, api.StatusFailed, api.StatusSucceeded, api.StatusStopped:
 	default:
 		s.mu.Unlock()
 		http.Error(w, "invalid assignment status", http.StatusBadRequest)
 		return
+	}
+	if (rep.Status == api.StatusStopped && asg.Status == api.StatusDraining && now.Before(asg.StopAfter)) || (rep.Status == api.StatusStopped && asg.Status != api.StatusStopping && asg.Status != api.StatusStopped && asg.Status != api.StatusDraining) || asg.Status == api.StatusReserved || (asg.Status == api.StatusStopping && rep.Status != api.StatusStopped) || (asg.Status == api.StatusDraining && rep.Status != api.StatusStopped) {
+		s.mu.Unlock()
+		http.Error(w, "assignment state is controlled by the controller", http.StatusConflict)
+		return
+	}
+	if rep.CheckpointDone != "" && asg.Checkpoint != nil && rep.CheckpointDone == asg.Checkpoint.ID && asg.Status == api.StatusRunning && rep.CheckpointProgress >= 0 && now.Before(asg.Checkpoint.Deadline) {
+		asg.CheckpointDone = rep.CheckpointDone
+		asg.CheckpointProgress = rep.CheckpointProgress
 	}
 	asg.Status = rep.Status
 	asg.Reason = rep.Reason
 	asg.Restarts = rep.Restarts
 	asg.RuntimeID = rep.RuntimeID
 	asg.HostPort = rep.HostPort
+	asg.HostPorts = rep.HostPorts
 	if rep.Logs != "" {
 		asg.Logs = tail(rep.Logs, 8192)
 	}
@@ -507,7 +544,24 @@ func (s *Server) handleConfirm(w http.ResponseWriter, r *http.Request) {
 	}
 	switch a.Kind {
 	case "delete":
-		if _, nodeErr := s.Store.GetNode(a.Target); nodeErr == nil {
+		if strings.HasPrefix(a.Target, "infra:pending:") {
+			state, stateErr := readInfra(s.Store)
+			if stateErr != nil || state.Pending == nil || a.Target != "infra:pending:"+pendingInfraKey(state) {
+				s.mu.Unlock()
+				http.Error(w, "provider operation already settled; inspect infra status", 409)
+				return
+			}
+		}
+		if a.TargetKind == api.KindApp {
+			if err := s.applyDeleteLocked(a.Target); err != nil {
+				s.mu.Unlock()
+				http.Error(w, err.Error(), 404)
+				return
+			}
+			a.Result = "done"
+		} else if strings.HasPrefix(a.Target, "infra:") {
+			a.Result = "confirmed"
+		} else if _, nodeErr := s.Store.GetNode(a.Target); nodeErr == nil {
 			a.Result = "confirmed"
 		} else {
 			if err = s.applyDeleteLocked(a.Target); err != nil {
@@ -565,6 +619,11 @@ func (s *Server) handleActionResult(w http.ResponseWriter, r *http.Request) {
 		if err := s.Store.DeleteNode(a.Target); err != nil {
 			s.mu.Unlock()
 			http.Error(w, err.Error(), http.StatusInternalServerError)
+			return
+		}
+		if err := s.Store.DeleteMeta("auth:node:" + a.Target); err != nil {
+			s.mu.Unlock()
+			http.Error(w, err.Error(), 500)
 			return
 		}
 	}
@@ -626,8 +685,20 @@ func (s *Server) handleImage(w http.ResponseWriter, r *http.Request) {
 			http.Error(w, "not leader", http.StatusConflict)
 			return
 		}
-		if err := images.Save(dir, ref, r.Body); err != nil {
+		if err := s.pruneImages(); err != nil {
 			http.Error(w, err.Error(), http.StatusInternalServerError)
+			return
+		}
+		limits := s.imageLimits
+		if limits.MaxBytes == 0 {
+			limits = images.Defaults()
+		}
+		if err := images.SaveLimited(dir, ref, r.Body, limits); err != nil {
+			status := http.StatusInternalServerError
+			if errors.Is(err, images.ErrCapacity) {
+				status = http.StatusInsufficientStorage
+			}
+			http.Error(w, err.Error(), status)
 			return
 		}
 		w.WriteHeader(http.StatusNoContent)
@@ -710,13 +781,31 @@ func (s *Server) handleElection(w http.ResponseWriter, r *http.Request) {
 
 func (s *Server) handleAct(w http.ResponseWriter, r *http.Request) {
 	var req struct {
-		Kind   string `json:"kind"`
-		Target string `json:"target"`
-		Reason string `json:"reason"`
+		Kind       string `json:"kind"`
+		TargetKind string `json:"target_kind"`
+		Target     string `json:"target"`
+		Reason     string `json:"reason"`
 	}
 	if err := readJSON(w, r, &req); err != nil {
 		http.Error(w, "bad act", http.StatusBadRequest)
 		return
+	}
+	if req.TargetKind != "" {
+		switch req.TargetKind {
+		case api.KindApp:
+			if _, err := s.Store.GetApp(req.Target); err != nil {
+				http.Error(w, "unknown App", 404)
+				return
+			}
+		case "Node":
+			if _, err := s.Store.GetNode(req.Target); err != nil {
+				http.Error(w, "unknown Node", 404)
+				return
+			}
+		default:
+			http.Error(w, "target_kind must be App or Node", 400)
+			return
+		}
 	}
 	pol, err := s.Store.Policy()
 	if err != nil {
@@ -736,13 +825,14 @@ func (s *Server) handleAct(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 	s.mu.Lock()
-	err = s.recordLocked(now, req.Kind, req.Target, req.Reason, result)
+	id := api.NewID()
+	err = s.Store.AddAction(api.Action{ID: id, At: now, Actor: "playbook", Kind: req.Kind, Target: req.Target, TargetKind: req.TargetKind, Reason: req.Reason, Result: result})
 	s.mu.Unlock()
 	if err != nil {
 		http.Error(w, err.Error(), http.StatusInternalServerError)
 		return
 	}
-	writeJSON(w, http.StatusOK, map[string]string{"result": result})
+	writeJSON(w, http.StatusOK, map[string]string{"result": result, "id": id})
 }
 
 func (s *Server) findings() ([]diagnose.Finding, error) {
@@ -762,7 +852,12 @@ func (s *Server) findings() ([]diagnose.Finding, error) {
 	if err != nil {
 		return nil, err
 	}
-	return diagnose.Scan(apps, nodes, asgs, pol.MaxRestarts, s.now()), nil
+	findings := diagnose.Scan(apps, nodes, asgs, pol.MaxRestarts, s.now())
+	placement, err := s.placementFindings(apps, nodes, asgs, pol)
+	if err != nil {
+		return nil, err
+	}
+	return append(findings, placement...), nil
 }
 
 func (s *Server) explain(question string) (string, error) {

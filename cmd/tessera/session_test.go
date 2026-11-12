@@ -100,7 +100,7 @@ func TestSessionUsesControllerAndLeavesItRunning(t *testing.T) {
 			t.Fatal(err)
 		}
 	})
-	if errs.Len() != 0 || !strings.Contains(output, "web image=nginx") || !strings.Contains(output, "ready=0/1") {
+	if errs.Len() != 0 || !strings.Contains(output, "web image=nginx") || !strings.Contains(output, "ready=0/1") || !strings.Contains(output, "no nodes have joined") || strings.Contains(output, "Nothing is failing") {
 		t.Fatalf("session output %s, errors %s", output, errs.String())
 	}
 	cl := client.New(httpServer.URL, srv.Token)

@@ -190,6 +190,39 @@ func TestSystemdLiteralSettings(t *testing.T) {
 	}
 }
 
+func TestInstallControllerAndGatewayRolesPreserveReplicationRoot(t *testing.T) {
+	for _, goos := range []string{"darwin", "linux"} {
+		for _, role := range []string{"controller", "gateway"} {
+			t.Run(goos+"/"+role, func(t *testing.T) {
+				home := t.TempDir()
+				source := filepath.Join(home, "source")
+				if err := os.WriteFile(source, []byte("binary"), 0755); err != nil {
+					t.Fatal(err)
+				}
+				opts := installOptions{Role: role, Data: filepath.Join(home, "data"), BinDir: filepath.Join(home, "bin"), Token: "rotated-admin-key", Runtime: "auto", AdvertiseURL: "http://controller:7468", Route: "web", Port: 8080, NoStart: true}
+				if err := os.MkdirAll(opts.Data, 0700); err != nil {
+					t.Fatal(err)
+				}
+				if err := os.WriteFile(filepath.Join(opts.Data, "token"), []byte("replication-root\n"), 0600); err != nil {
+					t.Fatal(err)
+				}
+				if err := installUser(goos, home, source, 501, opts, nil, io.Discard); err != nil {
+					t.Fatal(err)
+				}
+				checkInstalledFile(t, filepath.Join(opts.Data, "token"), "replication-root\n", 0600)
+				if role == "controller" {
+					opts.Listen = ":7468"
+				}
+				path, _ := userService(goos, home, filepath.Join(opts.BinDir, "tessera"), opts)
+				body, err := os.ReadFile(path)
+				if err != nil || !strings.Contains(string(body), role) || strings.Contains(string(body), "rotated-admin-key") {
+					t.Fatalf("invalid service: %s %v", body, err)
+				}
+			})
+		}
+	}
+}
+
 func checkInstalledFile(t *testing.T, path, want string, mode os.FileMode) {
 	t.Helper()
 	body, err := os.ReadFile(path)

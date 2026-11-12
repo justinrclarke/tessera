@@ -10,6 +10,7 @@ import (
 )
 
 type Instance struct {
+	Key      string `json:"key,omitempty"`
 	Provider string `json:"provider"`
 	ID       string `json:"id"`
 	Name     string `json:"name"`
@@ -117,12 +118,16 @@ func parseAWS(raw []byte) ([]Instance, error) {
 				continue
 			}
 			name := vm.ID
+			key := ""
 			for _, tag := range vm.Tags {
+				if tag.Key == "tessera-key" {
+					key = tag.Value
+				}
 				if tag.Key == "Name" && tag.Value != "" {
 					name = tag.Value
 				}
 			}
-			out = append(out, Instance{Provider: "aws", ID: vm.ID, Name: name, Region: vm.Placement.Zone, Type: vm.Type, State: vm.State.Name, Private: vm.Private, Public: vm.Public})
+			out = append(out, Instance{Key: key, Provider: "aws", ID: vm.ID, Name: name, Region: vm.Placement.Zone, Type: vm.Type, State: vm.State.Name, Private: vm.Private, Public: vm.Public})
 		}
 	}
 	return out, nil
@@ -141,20 +146,21 @@ func parseGCP(raw []byte) ([]Instance, error) {
 				NatIP string `json:"natIP"`
 			} `json:"accessConfigs"`
 		} `json:"networkInterfaces"`
+		Labels map[string]string `json:"labels"`
 	}
 	if err := json.Unmarshal(raw, &body); err != nil {
 		return nil, err
 	}
 	var out []Instance
 	for _, vm := range body {
-		if vm.Name == "" || vm.Status == "TERMINATED" {
+		if vm.Name == "" {
 			continue
 		}
 		id := vm.ID
 		if id == "" {
 			id = last(vm.Zone) + "/" + vm.Name
 		}
-		item := Instance{Provider: "gcp", ID: id, Name: vm.Name, Region: last(vm.Zone), Type: last(vm.MachineType), State: strings.ToLower(vm.Status)}
+		item := Instance{Key: vm.Labels["tessera-key"], Provider: "gcp", ID: id, Name: vm.Name, Region: last(vm.Zone), Type: last(vm.MachineType), State: strings.ToLower(vm.Status)}
 		if len(vm.NetworkInterfaces) > 0 {
 			item.Private = vm.NetworkInterfaces[0].NetworkIP
 			if len(vm.NetworkInterfaces[0].AccessConfigs) > 0 {
@@ -168,12 +174,13 @@ func parseGCP(raw []byte) ([]Instance, error) {
 
 func parseAzure(raw []byte) ([]Instance, error) {
 	var body []struct {
-		ID              string `json:"id"`
-		Name            string `json:"name"`
-		Location        string `json:"location"`
-		PowerState      string `json:"powerState"`
-		PrivateIPs      string `json:"privateIps"`
-		PublicIPs       string `json:"publicIps"`
+		ID              string            `json:"id"`
+		Name            string            `json:"name"`
+		Location        string            `json:"location"`
+		PowerState      string            `json:"powerState"`
+		PrivateIPs      string            `json:"privateIps"`
+		PublicIPs       string            `json:"publicIps"`
+		Tags            map[string]string `json:"tags"`
 		HardwareProfile struct {
 			VMSize string `json:"vmSize"`
 		} `json:"hardwareProfile"`
@@ -186,7 +193,7 @@ func parseAzure(raw []byte) ([]Instance, error) {
 		if vm.ID == "" {
 			continue
 		}
-		out = append(out, Instance{Provider: "azure", ID: vm.ID, Name: vm.Name, Region: vm.Location, Type: vm.HardwareProfile.VMSize, State: vm.PowerState, Private: vm.PrivateIPs, Public: vm.PublicIPs})
+		out = append(out, Instance{Key: vm.Tags["tessera-key"], Provider: "azure", ID: vm.ID, Name: vm.Name, Region: vm.Location, Type: vm.HardwareProfile.VMSize, State: vm.PowerState, Private: vm.PrivateIPs, Public: vm.PublicIPs})
 	}
 	return out, nil
 }

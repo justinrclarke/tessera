@@ -14,6 +14,8 @@ metadata:
 spec:
   replicas: 2
   template:
+    metadata:
+      labels: {app: web}
     spec:
       containers:
       - name: web
@@ -30,6 +32,7 @@ kind: Service
 metadata:
   name: web
 spec:
+  selector: {app: web}
   ports:
   - port: 80
     targetPort: 80
@@ -65,7 +68,7 @@ func TestFromClusterReportsUnsupportedResources(t *testing.T) {
 		joined := strings.Join(args, " ")
 		switch {
 		case strings.Contains(joined, "get deployments,statefulsets,daemonsets,jobs,services,ingresses,configmaps,secrets -A -o json"):
-			return []byte(`{"items":[{"kind":"StatefulSet","metadata":{"name":"db"},"spec":{"template":{"spec":{"containers":[{"image":"postgres:17"}]}}}}]}`), nil
+			return []byte(`{"items":[{"kind":"Deployment","metadata":{"name":"db"},"spec":{"template":{"spec":{"containers":[{"image":"postgres:17"}]}}}}]}`), nil
 		case strings.Contains(joined, "get all -A -o json"):
 			return []byte(`{"items":[{"kind":"Pod","metadata":{"name":"db-0"}},{"kind":"ReplicaSet","metadata":{"name":"web-rs"}}]}`), nil
 		case strings.Contains(joined, "get customresourcedefinitions,mutatingwebhookconfigurations,validatingwebhookconfigurations -o json"):
@@ -86,21 +89,15 @@ func TestFromClusterReportsUnsupportedResources(t *testing.T) {
 }
 
 func TestConvertAllServicePorts(t *testing.T) {
-	res, err := Convert([]byte(`kind: Service
-metadata:
-  name: web
-spec:
-  ports:
-    - port: 80
-      targetPort: 8080
-    - port: 443
-      targetPort: 8443
-`))
+	res, err := Convert([]byte(strings.Replace(manifest, "    targetPort: 80", "    targetPort: 8080\n  - port: 443\n    targetPort: 8443", 1)))
 	if err != nil {
 		t.Fatal(err)
 	}
-	if len(res.Objects) != 2 || res.Objects[0].Route.Port != 80 || res.Objects[1].Route.Port != 443 || res.Objects[0].Route.Name == res.Objects[1].Route.Name {
+	if len(res.Objects) != 3 || res.Objects[1].Route.Port != 80 || res.Objects[2].Route.Port != 443 || res.Objects[1].Route.Name == res.Objects[2].Route.Name {
 		t.Fatalf("routes: %+v", res.Objects)
+	}
+	if len(res.Objects[0].App.Ports) != 3 {
+		t.Fatalf("target ports were not published: %+v", res.Objects[0].App.Ports)
 	}
 }
 

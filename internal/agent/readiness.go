@@ -27,9 +27,13 @@ func (a *Agent) reportReady(ctx context.Context, d api.Assignment, c runtime.Con
 	}
 	probeCtx, cancel := context.WithTimeout(ctx, healthDuration(d.Health.Timeout, 2*time.Second))
 	defer cancel()
-	req, err := http.NewRequestWithContext(probeCtx, http.MethodGet, fmt.Sprintf("http://127.0.0.1:%d%s", c.HostPort, d.Health.Path), nil)
+	port := c.HostPort
+	if len(c.HostPorts) > 0 {
+		port = c.HostPorts[d.Health.Port]
+	}
+	req, err := http.NewRequestWithContext(probeCtx, http.MethodGet, fmt.Sprintf("http://127.0.0.1:%d%s", port, d.Health.Path), nil)
 	ready := false
-	if err == nil && c.HostPort > 0 {
+	if err == nil && port > 0 {
 		cl := &http.Client{Transport: readinessTransport, CheckRedirect: func(*http.Request, []*http.Request) error { return http.ErrUseLastResponse }}
 		resp, err := cl.Do(req)
 		if err == nil {

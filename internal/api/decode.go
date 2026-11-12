@@ -3,7 +3,10 @@ package api
 import (
 	"bytes"
 	"fmt"
+	"math"
 	"net/url"
+	"path/filepath"
+	"strconv"
 	"strings"
 	"time"
 
@@ -60,6 +63,9 @@ func DecodeOne(b []byte) (Object, error) {
 			return Object{}, err
 		}
 		r.Kind = KindRoute
+		if r.Name == "" || r.App == "" || r.Port < 1 || r.Port > 65535 || r.TargetPort < 0 || r.TargetPort > 65535 {
+			return Object{}, fmt.Errorf("Route requires name, app, a listen port between 1 and 65535, and an optional valid target_port")
+		}
 		return Object{Kind: KindRoute, Route: &r}, nil
 	case KindConfig:
 		c, err := decodeMapKind(raw, KindConfig)
@@ -115,6 +121,14 @@ func decodeApp(raw map[string]any, kind string) (App, error) {
 	if app.Replicas < 0 {
 		return App{}, fmt.Errorf("app %s: replicas cannot be negative", app.Name)
 	}
+	if app.Storage != nil {
+		if err := app.Storage.Validate(); err != nil {
+			return App{}, err
+		}
+		if app.Replicas > 1 || app.Kind != KindApp || app.Gang || app.Checkpoint != nil {
+			return App{}, fmt.Errorf("storage requires a single-replica App without checkpointing")
+		}
+	}
 	if app.Name == "" {
 		return App{}, fmt.Errorf("app name is required")
 	}
@@ -148,8 +162,12 @@ func decodeApp(raw map[string]any, kind string) (App, error) {
 		if err != nil || !strings.HasPrefix(h.Path, "/") || strings.HasPrefix(h.Path, "//") || u.Host != "" || u.Fragment != "" || app.Kind == KindJob {
 			return App{}, fmt.Errorf("app %s: health requires an HTTP path on an App", app.Name)
 		}
-		if len(app.Ports) != 1 || h.Port != app.Ports[0].Container {
-			return App{}, fmt.Errorf("app %s: health port must match the single published container port", app.Name)
+		matched := false
+		for _, p := range app.Ports {
+			matched = matched || h.Port == p.Container
+		}
+		if !matched {
+			return App{}, fmt.Errorf("app %s: health port must match a published container port", app.Name)
 		}
 		for _, value := range []string{h.Timeout, h.StartupTimeout} {
 			if value != "" {
@@ -181,6 +199,23 @@ func decodeApp(raw map[string]any, kind string) (App, error) {
 	if app.GangFabric != "" && (!app.Gang || app.Kind != KindJob) {
 		return App{}, fmt.Errorf("app %s: gang_fabric requires a gang Job", app.Name)
 	}
+	if app.Checkpoint != nil {
+		c := app.Checkpoint
+		if app.Kind != KindJob || !app.Gang || !filepath.IsAbs(c.Directory) || filepath.Clean(c.Directory) == "/" || strings.ContainsAny(c.Directory, "\x00\r\n,:") {
+			return App{}, fmt.Errorf("app %s: checkpoint requires a gang Job and an absolute shared directory other than /", app.Name)
+		}
+		if c.Timeout != "" {
+			if d, err := time.ParseDuration(c.Timeout); err != nil || d <= 0 {
+				return App{}, fmt.Errorf("app %s: checkpoint timeout must be a positive duration", app.Name)
+			}
+		}
+	}
+	if app.DrainTimeout != "" {
+		d, err := time.ParseDuration(app.DrainTimeout)
+		if err != nil || d <= 0 || d > time.Hour || app.Kind == KindJob {
+			return App{}, fmt.Errorf("app %s: drain_timeout requires an App and a positive duration no greater than one hour", app.Name)
+		}
+	}
 	if app.SensitiveTo == "" && app.GPUs > 0 {
 		app.SensitiveTo = "gpu"
 	}
@@ -193,6 +228,11 @@ type namedData struct {
 }
 
 func decodeMapKind(raw map[string]any, kind string) (namedData, error) {
+	for key := range raw {
+		if key != "kind" && key != "name" && key != "data" {
+			return namedData{}, fmt.Errorf("%s: unknown field %q", kind, key)
+		}
+	}
 	name, _ := raw["name"].(string)
 	if name == "" {
 		return namedData{}, fmt.Errorf("%s name is required", kind)
@@ -201,16 +241,27 @@ func decodeMapKind(raw map[string]any, kind string) (namedData, error) {
 	switch d := raw["data"].(type) {
 	case map[string]any:
 		for k, v := range d {
+			switch v.(type) {
+			case string, int, int64, float64, bool:
+			default:
+				return namedData{}, fmt.Errorf("%s %s: data values must be scalars", kind, name)
+			}
 			data[k] = scalarString(v)
 		}
 	case map[string]string:
 		data = d
+	case nil:
+	default:
+		return namedData{}, fmt.Errorf("%s %s: data must be a mapping", kind, name)
 	}
 	return namedData{name: name, data: data}, nil
 }
 
 func decodePolicy(raw map[string]any) (Policy, error) {
 	mv, _ := raw["move"].(map[string]any)
+	if raw["move"] != nil && mv == nil {
+		return Policy{}, fmt.Errorf("Policy move must contain min_gain or cooldown")
+	}
 	delete(raw, "move")
 	var p Policy
 	if err := remarshal(raw, &p); err != nil {
@@ -218,10 +269,17 @@ func decodePolicy(raw map[string]any) (Policy, error) {
 	}
 	p.Kind = KindPolicy
 	if mv != nil {
+		for key := range mv {
+			if key != "min_gain" && key != "cooldown" {
+				return Policy{}, fmt.Errorf("Policy move: unknown field %q", key)
+			}
+		}
 		if g, ok := mv["min_gain"]; ok {
 			fmtS := scalarString(g)
-			var f float64
-			fmt.Sscan(fmtS, &f)
+			f, err := strconv.ParseFloat(fmtS, 64)
+			if err != nil {
+				return Policy{}, fmt.Errorf("Policy move min_gain must be a finite nonnegative number")
+			}
 			p.MoveMinGain = f
 		}
 		if c, ok := mv["cooldown"]; ok {
@@ -239,6 +297,26 @@ func decodePolicy(raw map[string]any) (Policy, error) {
 	}
 	if p.MaxRestarts == 0 {
 		p.MaxRestarts = 3
+	}
+	if math.IsNaN(p.MoveMinGain) || math.IsInf(p.MoveMinGain, 0) || p.MoveMinGain < 0 || p.MaxRestarts < 0 {
+		return Policy{}, fmt.Errorf("Policy gain and restart limit must be finite and nonnegative")
+	}
+	for _, value := range []string{p.MoveCooldown, p.SoloPromotion, p.SuspectAfter, p.DeadAfter, p.LeaseTTL} {
+		if value != "" {
+			if d, err := time.ParseDuration(value); err != nil || d <= 0 {
+				return Policy{}, fmt.Errorf("Policy timing settings must be positive durations")
+			}
+		}
+	}
+	if p.Dead() <= p.Suspect() {
+		return Policy{}, fmt.Errorf("Policy dead_after must exceed suspect_after")
+	}
+	for _, action := range append(append([]string(nil), p.Auto...), p.Confirm...) {
+		switch action {
+		case "restart", "reschedule", "cordon", "uncordon", "rollback", "prune", "renew", "move", "hold", "delete", "wipe", "reimage":
+		default:
+			return Policy{}, fmt.Errorf("Policy: unknown action %q", action)
+		}
 	}
 	return p, nil
 }

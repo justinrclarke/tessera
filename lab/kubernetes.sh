@@ -48,7 +48,7 @@ done
 
 (cd "$repo_dir" && sh "$lab_dir/lab.sh" up)
 "$temp_dir/tessera" import --from-cluster --kubeconfig "$kubeconfig" --namespace bridge --dry-run > "$temp_dir/import.yaml"
-grep -q '^name: bridge-api$' "$temp_dir/import.yaml"
+grep -q '^name: bridge.bridge-api$' "$temp_dir/import.yaml"
 grep -q '^kind: Route$' "$temp_dir/import.yaml"
 (cd "$repo_dir" && sh "$lab_dir/lab.sh" apply "$temp_dir/import.yaml")
 docker compose -f "$compose_file" exec -T controller sh -c '

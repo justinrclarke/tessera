@@ -36,7 +36,7 @@ func newReplicaTestCluster(t *testing.T) *replicaTestCluster {
 	return newReplicaTestClusterTransport(t, false)
 }
 
-func newReplicaTestClusterTransport(t *testing.T, tcp bool) *replicaTestCluster {
+func newReplicaTestClusterTransport(t *testing.T, tcp bool, configure ...func(*Server)) *replicaTestCluster {
 	t.Helper()
 	c := &replicaTestCluster{servers: make([]*Server, 3), transports: make([]*raft.InmemTransport, 3), dirs: make([]string, 3), stopped: make([]bool, 3), tcp: tcp}
 	listeners := make([]net.Listener, 3)
@@ -91,6 +91,9 @@ func newReplicaTestClusterTransport(t *testing.T, tcp bool) *replicaTestCluster 
 			t.Fatal(err)
 		}
 		c.servers[i] = srv
+		for _, configureServer := range configure {
+			configureServer(srv)
+		}
 		go func() { _ = srv.Serve(context.Background(), listeners[i]) }()
 	}
 	for i := range c.servers {

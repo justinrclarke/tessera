@@ -71,19 +71,23 @@ func (c *Client) SetControllers(values []string) {
 }
 
 type RegisterRequest struct {
-	ID           string            `json:"id"`
-	Addr         string            `json:"addr"`
-	Capacity     api.Resources     `json:"capacity"`
-	Free         api.Resources     `json:"free"`
-	Perf         api.Perf          `json:"perf"`
-	GPUs         int               `json:"gpus"`
-	GPUInventory []api.GPU         `json:"gpu_inventory,omitempty"`
-	DiskFree     int64             `json:"disk_free"`
-	DiskTotal    int64             `json:"disk_total"`
-	Labels       map[string]string `json:"labels,omitempty"`
+	StorageCapable bool              `json:"storage_capable,omitempty"`
+	Restricted     bool              `json:"restricted,omitempty"`
+	Runtime        string            `json:"runtime,omitempty"`
+	ID             string            `json:"id"`
+	Addr           string            `json:"addr"`
+	Capacity       api.Resources     `json:"capacity"`
+	Free           api.Resources     `json:"free"`
+	Perf           api.Perf          `json:"perf"`
+	GPUs           int               `json:"gpus"`
+	GPUInventory   []api.GPU         `json:"gpu_inventory,omitempty"`
+	DiskFree       int64             `json:"disk_free"`
+	DiskTotal      int64             `json:"disk_total"`
+	Labels         map[string]string `json:"labels,omitempty"`
 }
 
 type RegisterResponse struct {
+	NodeToken string    `json:"node_token,omitempty"`
 	CertPEM   string    `json:"cert_pem"`
 	KeyPEM    string    `json:"key_pem"`
 	CAPem     string    `json:"ca_pem"`
@@ -93,6 +97,7 @@ type RegisterResponse struct {
 }
 
 type HeartbeatRequest struct {
+	Runtime      string        `json:"runtime,omitempty"`
 	Addr         string        `json:"addr"`
 	Capacity     api.Resources `json:"capacity"`
 	Free         api.Resources `json:"free"`
@@ -123,13 +128,16 @@ type NodeCommand struct {
 }
 
 type StatusReport struct {
-	Epoch     uint64 `json:"epoch,omitempty"`
-	Status    string `json:"status"`
-	Reason    string `json:"reason"`
-	Restarts  int    `json:"restarts"`
-	RuntimeID string `json:"runtime_id"`
-	HostPort  int    `json:"host_port"`
-	Logs      string `json:"logs"`
+	HostPorts          map[int]int `json:"host_ports,omitempty"`
+	CheckpointDone     string      `json:"checkpoint_done,omitempty"`
+	CheckpointProgress int64       `json:"checkpoint_progress,omitempty"`
+	Epoch              uint64      `json:"epoch,omitempty"`
+	Status             string      `json:"status"`
+	Reason             string      `json:"reason"`
+	Restarts           int         `json:"restarts"`
+	RuntimeID          string      `json:"runtime_id"`
+	HostPort           int         `json:"host_port"`
+	Logs               string      `json:"logs"`
 }
 
 type Page struct {
@@ -297,6 +305,14 @@ func (c *Client) Act(ctx context.Context, kind, target, reason string) (string, 
 	return out.Result, err
 }
 
+func (c *Client) ProposeDelete(ctx context.Context, kind, target, reason string) (string, error) {
+	var result struct {
+		ID string `json:"id"`
+	}
+	err := c.post(ctx, "/v1/act", map[string]string{"kind": "delete", "target_kind": kind, "target": target, "reason": reason}, &result)
+	return result.ID, err
+}
+
 func (c *Client) Ask(ctx context.Context, question string) (string, error) {
 	b, err := json.Marshal(map[string]string{"question": question})
 	if err != nil {
@@ -313,6 +329,46 @@ func (c *Client) Ask(ctx context.Context, question string) (string, error) {
 		return "", err
 	}
 	return out.Text, nil
+}
+
+func (c *Client) InfrastructureApply(ctx context.Context, body []byte) (string, error) {
+	raw, err := c.call(ctx, http.MethodPost, "/v1/infra/apply", body, true)
+	return string(raw), err
+}
+func (c *Client) InfrastructureStatus(ctx context.Context) ([]byte, error) {
+	return c.call(ctx, http.MethodGet, "/v1/infra/status", nil, false)
+}
+
+func (c *Client) InfrastructureAbandon(ctx context.Context) (string, error) {
+	raw, err := c.call(ctx, http.MethodPost, "/v1/infra/abandon", []byte("{}"), true)
+	return string(raw), err
+}
+
+func (c *Client) JoinToken(ctx context.Context, node, ttl string) (string, error) {
+	var out struct {
+		Token string `json:"token"`
+	}
+	err := c.post(ctx, "/v1/tokens/join", map[string]string{"node": node, "ttl": ttl}, &out)
+	return out.Token, err
+}
+func (c *Client) GatewayToken(ctx context.Context, route string) (string, error) {
+	var out struct {
+		Token string `json:"token"`
+	}
+	err := c.post(ctx, "/v1/tokens/gateway", map[string]string{"route": route}, &out)
+	return out.Token, err
+}
+func (c *Client) RevokeNode(ctx context.Context, node string) error {
+	return c.post(ctx, "/v1/tokens/revoke", map[string]string{"node": node}, nil)
+}
+func (c *Client) RotateToken(ctx context.Context, token string) error {
+	return c.post(ctx, "/v1/tokens/rotate", map[string]string{"token": token}, nil)
+}
+
+func (c *Client) InfrastructureRollback(ctx context.Context, generation string) (string, error) {
+	body, _ := json.Marshal(map[string]string{"generation": generation})
+	raw, err := c.call(ctx, http.MethodPost, "/v1/infra/rollback", body, true)
+	return string(raw), err
 }
 
 func (c *Client) Register(ctx context.Context, req RegisterRequest) (RegisterResponse, error) {

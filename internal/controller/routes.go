@@ -29,7 +29,11 @@ func (s *Server) handleRouteBackends(w http.ResponseWriter, r *http.Request) {
 			http.Error(w, err.Error(), http.StatusInternalServerError)
 			return
 		}
-		writeJSON(w, http.StatusOK, api.RouteBackends{Epoch: s.epoch, Backends: proxy.Backends(route, assignments, nodes)})
+		drain := ""
+		if app, err := s.Store.GetApp(route.App); err == nil {
+			drain = app.DrainTimeout
+		}
+		writeJSON(w, http.StatusOK, api.RouteBackends{Epoch: s.epoch, Backends: proxy.Backends(route, assignments, nodes), DrainTimeout: drain})
 		return
 	}
 	http.Error(w, "route not found", http.StatusNotFound)

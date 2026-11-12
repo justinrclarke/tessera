@@ -32,8 +32,6 @@ import (
 	"tessera/internal/stackbuild"
 	"tessera/internal/store"
 	"tessera/internal/watchdog"
-
-	"gopkg.in/yaml.v3"
 )
 
 func main() {
@@ -54,6 +52,8 @@ func run(args []string) error {
 	case "version":
 		fmt.Println(api.Version)
 		return nil
+	case "storage":
+		return cmdStorage(args[1:])
 	case "up":
 		rest := stripFlag(args[1:], "--watched")
 		if os.Getenv("TESSERA_WATCHED") != "1" && !hasFlag(args, "--watched") {
@@ -68,10 +68,18 @@ func run(args []string) error {
 		return cmdGateway(args[1:])
 	case "apply":
 		return cmdApply(args[1:])
+	case "build":
+		return cmdBuild(args[1:])
+	case "checkpoint":
+		return cmdCheckpoint(args[1:])
 	case "get":
 		return cmdGet(args[1:])
 	case "confirm":
 		return cmdConfirm(args[1:])
+	case "delete":
+		return cmdDelete(args[1:])
+	case "token":
+		return cmdToken(args[1:])
 	case "ask":
 		return cmdAsk(args[1:])
 	case "session":
@@ -114,11 +122,20 @@ from a signed snapshot if the current one dies. Destructive actions stay propose
   tessera install [--url http://controller:7468] [--token TOKEN] [--runtime auto|docker|ctr|fake]
   tessera session
   tessera apply -f app.yaml
+  tessera build -f app.yaml -o release.yaml [--archive images.tar]
+  tessera storage backup --app NAME -o data.tar
+  tessera storage restore -f data.tar --directory NEW_DIRECTORY
   tessera get apps|nodes|assignments|actions|routes|controllers
+  tessera delete app NAME | node ID
   tessera confirm [id]
+  tessera token join --node ID [--ttl 10m]
+  tessera token gateway --route NAME
+  tessera token revoke --node ID
+  tessera token rotate|recover
+  tessera checkpoint commit --request FILE --assignment ID --progress N
   tessera ask "why is web down"
   tessera agent [--url http://controller:7468]
-	  tessera gateway --route web [--port 8080]
+  tessera gateway --route web [--port 8080]
   tessera controller [--id ID --raft-listen HOST:PORT --peers ID=RAFT_ADDRESS@HTTP_URL,... --bootstrap]
   tessera import -f deploy.yaml
   tessera mcp
@@ -126,6 +143,8 @@ from a signed snapshot if the current one dies. Destructive actions stay propose
   tessera restore -f tessera-backup.db --data NEW_DIRECTORY
   tessera cloud inventory --provider aws|gcp|azure
   tessera infra plan -f desired.yaml [--state current.json]
+  tessera infra apply -f desired.yaml
+  tessera infra status|rollback|abandon-pending
   tessera drill
 
 An agent that already has the token joins over mDNS. No IP required.
@@ -188,14 +207,20 @@ func cmdController(args []string) error {
 	listen := fs.String("listen", "0.0.0.0:7468", "listen address")
 	data := fs.String("data", config.Dir(), "data directory")
 	id := fs.String("id", "", "stable controller ID")
-	token := fs.String("token", os.Getenv("TESSERA_TOKEN"), "shared cluster token")
+	advertiseURL := fs.String("advertise-url", "", "reachable controller HTTP URL")
+	token := fs.String("token", "", "replication root; defaults to saved token, then TESSERA_TOKEN")
 	raftListen := fs.String("raft-listen", "", "replication listen address")
 	peersArg := fs.String("peers", "", "three ID=RAFT_ADDRESS@HTTP_URL peers, separated by commas")
 	bootstrap := fs.Bool("bootstrap", false, "bootstrap a new three-controller cluster once")
 	if err := fs.Parse(args); err != nil {
 		return err
 	}
-	cfg := controller.Config{ID: *id, Token: *token}
+	if *token == "" {
+		if body, err := os.ReadFile(filepath.Join(*data, "token")); err == nil {
+			*token = strings.TrimSpace(string(body))
+		}
+	}
+	cfg := controller.Config{ID: *id, Token: *token, URL: *advertiseURL}
 	if *peersArg != "" {
 		peers, err := parseControllerPeers(*peersArg)
 		if err != nil {
@@ -227,6 +252,9 @@ func cmdAgent(args []string) error {
 	urlFlag := fs.String("url", "", "controller URL; discovered over mDNS if empty")
 	token := fs.String("token", os.Getenv("TESSERA_TOKEN"), "cluster token")
 	id := fs.String("id", os.Getenv("TESSERA_NODE_ID"), "stable node ID")
+	addr := fs.String("addr", "", "reachable node address for Routes")
+	restricted := fs.Bool("restricted", false, "use a scoped node credential without controller promotion")
+	lockDir := fs.String("lock-dir", "", "shared runtime ownership lock directory")
 	data := fs.String("data", filepath.Join(config.Dir(), "agent"), "agent data directory")
 	runtimeName := fs.String("runtime", "auto", "container runtime")
 	labelsArg := fs.String("labels", "", "comma-separated node labels")
@@ -279,7 +307,7 @@ func cmdAgent(args []string) error {
 	if err != nil {
 		return fmt.Errorf("runtime: %w", err)
 	}
-	ag := &agent.Agent{ID: *id, DataDir: *data, Token: *token, URL: url, Client: client.New(url, *token), Runtime: rtm, Labels: labels}
+	ag := &agent.Agent{ID: *id, DataDir: *data, Token: *token, URL: url, Client: client.New(url, *token), Runtime: rtm, Labels: labels, Addr: *addr, Restricted: *restricted, LockDir: *lockDir}
 	if cfg, err := config.Load(config.Dir()); err == nil {
 		ag.Client.SetControllers(cfg.Controllers)
 	}
@@ -344,8 +372,58 @@ func cmdCloud(args []string) error {
 }
 
 func cmdInfra(args []string) error {
-	if len(args) == 0 || args[0] != "plan" {
-		return fmt.Errorf("usage: tessera infra plan -f desired.yaml [--state current.json]")
+	if len(args) > 0 && args[0] == "abandon-pending" {
+		if len(args) != 1 {
+			return fmt.Errorf("infra abandon-pending takes no arguments")
+		}
+		cl, err := openClient()
+		if err != nil {
+			return err
+		}
+		result, err := cl.InfrastructureAbandon(context.Background())
+		if err != nil {
+			return err
+		}
+		fmt.Println(result)
+		return nil
+	}
+	if len(args) > 0 && args[0] == "rollback" {
+		fs := flag.NewFlagSet("infra rollback", flag.ContinueOnError)
+		generation := fs.String("generation", "", "previous intent generation; defaults to latest")
+		if err := fs.Parse(args[1:]); err != nil {
+			return err
+		}
+		if fs.NArg() != 0 {
+			return fmt.Errorf("infra rollback takes flags only")
+		}
+		cl, err := openClient()
+		if err != nil {
+			return err
+		}
+		result, err := cl.InfrastructureRollback(context.Background(), *generation)
+		if err != nil {
+			return err
+		}
+		fmt.Println(result)
+		return nil
+	}
+	if len(args) == 0 || (args[0] != "plan" && args[0] != "apply" && args[0] != "status") {
+		return fmt.Errorf("usage: tessera infra plan|apply -f desired.yaml | tessera infra status")
+	}
+	if args[0] == "status" {
+		if len(args) != 1 {
+			return fmt.Errorf("infra status takes no arguments")
+		}
+		cl, err := openClient()
+		if err != nil {
+			return err
+		}
+		raw, err := cl.InfrastructureStatus(context.Background())
+		if err != nil {
+			return err
+		}
+		fmt.Println(string(raw))
+		return nil
 	}
 	fs := flag.NewFlagSet("infra plan", flag.ContinueOnError)
 	file := fs.String("f", "", "desired infrastructure YAML")
@@ -364,6 +442,21 @@ func cmdInfra(args []string) error {
 	if err != nil {
 		return err
 	}
+	if args[0] == "apply" {
+		if *stateFile != "" {
+			return fmt.Errorf("infra apply uses the controller's recorded state")
+		}
+		cl, err := openClient()
+		if err != nil {
+			return err
+		}
+		result, err := cl.InfrastructureApply(context.Background(), body)
+		if err != nil {
+			return err
+		}
+		fmt.Println(result)
+		return nil
+	}
 	var state infra.State
 	if *stateFile != "" {
 		body, err := os.ReadFile(*stateFile)
@@ -373,6 +466,18 @@ func cmdInfra(args []string) error {
 		if err := json.Unmarshal(body, &state); err != nil {
 			return err
 		}
+	} else if cl, err := openClient(); err == nil {
+		raw, err := cl.InfrastructureStatus(context.Background())
+		if err != nil {
+			return err
+		}
+		var current struct {
+			State infra.State `json:"state"`
+		}
+		if err := json.Unmarshal(raw, &current); err != nil {
+			return err
+		}
+		state = current.State
 	}
 	plan, err := infra.Plan(desired, state)
 	if err != nil {
@@ -595,35 +700,15 @@ func cmdImport(args []string) error {
 	for _, s := range res.Skipped {
 		fmt.Fprintf(os.Stderr, "skipped %s\n", s)
 	}
-	var buf strings.Builder
-	enc := yaml.NewEncoder(&buf)
-	for _, obj := range res.Objects {
-		var v any
-		switch {
-		case obj.App != nil:
-			v = obj.App
-		case obj.Route != nil:
-			v = obj.Route
-		case obj.Config != nil:
-			v = obj.Config
-		case obj.Secret != nil:
-			v = obj.Secret
-		default:
-			continue
-		}
-		if err := enc.Encode(v); err != nil {
-			return err
-		}
-	}
 	if *dry {
-		fmt.Print(buf.String())
+		fmt.Print(res.YAML)
 		return nil
 	}
 	cl, err := openClient()
 	if err != nil {
 		return err
 	}
-	return cl.Apply(context.Background(), []byte(buf.String()))
+	return cl.Apply(context.Background(), []byte(res.YAML))
 }
 
 func cmdDrill() error {
@@ -667,7 +752,7 @@ func cmdRestore(args []string) error {
 }
 
 func startController(ctx context.Context, listen, data string) (*controller.Server, *client.Client, error) {
-	return startControllerConfig(ctx, listen, data, controller.Config{Token: os.Getenv("TESSERA_TOKEN")})
+	return startControllerConfig(ctx, listen, data, controller.Config{})
 }
 
 func startControllerConfig(ctx context.Context, listen, data string, cfg controller.Config) (*controller.Server, *client.Client, error) {
@@ -677,6 +762,18 @@ func startControllerConfig(ctx context.Context, listen, data string, cfg control
 	st, err := store.Open(filepath.Join(data, "tessera.db"))
 	if err != nil {
 		return nil, nil, err
+	}
+	if cfg.Token == "" {
+		stored, err := st.Meta("token")
+		if err != nil {
+			st.Close()
+			return nil, nil, err
+		}
+		if stored != "" {
+			cfg.Token = stored
+		} else {
+			cfg.Token = os.Getenv("TESSERA_TOKEN")
+		}
 	}
 	ln, err := net.Listen("tcp", listen)
 	if err != nil {
@@ -697,9 +794,9 @@ func startControllerConfig(ctx context.Context, listen, data string, cfg control
 		return nil, nil, err
 	}
 	go func() { _ = srv.Serve(ctx, ln) }()
-	cl := client.New("http://"+reachable(ln.Addr().String()), srv.Token)
+	cl := client.New("http://"+reachable(ln.Addr().String()), srv.ClientToken())
 	if cfg.Replicas != nil {
-		cl = client.New(cfg.URL, srv.Token)
+		cl = client.New(cfg.URL, srv.ClientToken())
 		var controllers []string
 		for _, peer := range cfg.Replicas.Peers {
 			controllers = append(controllers, peer.URL)

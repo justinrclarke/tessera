@@ -13,7 +13,9 @@ import (
 	"time"
 
 	"tessera/internal/api"
+	"tessera/internal/cloud"
 	"tessera/internal/config"
+	"tessera/internal/images"
 	"tessera/internal/pki"
 	"tessera/internal/proxy"
 	"tessera/internal/store"
@@ -30,13 +32,16 @@ type Config struct {
 }
 
 type Server struct {
-	Store    *store.Store
-	Token    string
-	ID       string
-	DataDir  string
-	URL      string
-	Now      func() time.Time
-	Discover func(ctx context.Context) ([]survive.Claim, error)
+	imageLimits  images.Limits
+	CloudFactory func(string, cloud.Settings) cloud.Provider
+	cloudMu      sync.Mutex
+	Store        *store.Store
+	Token        string
+	ID           string
+	DataDir      string
+	URL          string
+	Now          func() time.Time
+	Discover     func(ctx context.Context) ([]survive.Claim, error)
 
 	mu          sync.Mutex
 	epoch       uint64
@@ -54,6 +59,10 @@ type Server struct {
 }
 
 func New(st *store.Store, cfg Config) (*Server, error) {
+	cacheLimits, err := imageLimits()
+	if err != nil {
+		return nil, err
+	}
 	if cfg.Replicas != nil {
 		if err := validateReplicas(cfg); err != nil {
 			return nil, err
@@ -88,9 +97,16 @@ func New(st *store.Store, cfg Config) (*Server, error) {
 	} else if value != "" {
 		return nil, errors.New("replicated controller requires its replica configuration; use restore for offline recovery")
 	}
-	token := cfg.Token
+	storedToken, err := st.Meta("token")
+	if err != nil {
+		return nil, err
+	}
+	if storedToken != "" && cfg.Token != "" && storedToken != cfg.Token {
+		return nil, errors.New("controller replication token must match the stored root; rotate API credentials with tessera token rotate")
+	}
+	token := storedToken
 	if token == "" {
-		token, _ = st.Meta("token")
+		token = cfg.Token
 	}
 	if token == "" {
 		token = newToken()
@@ -134,17 +150,18 @@ func New(st *store.Store, cfg Config) (*Server, error) {
 		}
 	}
 	s := &Server{
-		Store:    st,
-		Token:    token,
-		ID:       id,
-		DataDir:  cfg.DataDir,
-		URL:      cfg.URL,
-		Now:      time.Now,
-		epoch:    epoch,
-		leading:  true,
-		lastMove: map[string]time.Time{},
-		ca:       ca,
-		proxy:    proxy.New(),
+		imageLimits: cacheLimits,
+		Store:       st,
+		Token:       token,
+		ID:          id,
+		DataDir:     cfg.DataDir,
+		URL:         cfg.URL,
+		Now:         time.Now,
+		epoch:       epoch,
+		leading:     true,
+		lastMove:    map[string]time.Time{},
+		ca:          ca,
+		proxy:       proxy.New(),
 	}
 	s.loadMoves()
 	if pending, err := st.Meta("restore_pending"); err != nil {
@@ -213,6 +230,10 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("GET /v1/leader", s.handleLeader)
 	mux.HandleFunc("GET /v1/controllers", s.handleControllerStatus)
 	mux.HandleFunc("POST /v1/apply", s.handleApply)
+	mux.HandleFunc("POST /v1/infra/apply", s.handleInfraApply)
+	mux.HandleFunc("POST /v1/infra/rollback", s.handleInfraRollback)
+	mux.HandleFunc("POST /v1/infra/abandon", s.handleInfraAbandon)
+	mux.HandleFunc("GET /v1/infra/status", s.handleInfraStatus)
 	mux.HandleFunc("GET /v1/apps", s.handleListApps)
 	mux.HandleFunc("GET /v1/apps/{name}", s.handleGetApp)
 	mux.HandleFunc("GET /v1/apps/{name}/logs", s.handleLogs)
@@ -234,6 +255,10 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("GET /v1/snapshot", s.handleSnapshot)
 	mux.HandleFunc("POST /v1/election", s.handleElection)
 	mux.HandleFunc("POST /v1/act", s.handleAct)
+	mux.HandleFunc("POST /v1/tokens/join", s.handleJoinToken)
+	mux.HandleFunc("POST /v1/tokens/rotate", s.handleRotateToken)
+	mux.HandleFunc("POST /v1/tokens/revoke", s.handleRevokeNode)
+	mux.HandleFunc("POST /v1/tokens/gateway", s.handleGatewayToken)
 	return s.auth(s.replicatedHandler(mux))
 }
 
@@ -245,7 +270,9 @@ func (s *Server) Serve(ctx context.Context, ln net.Listener) error {
 		s.URL = clientURL(ln.Addr())
 	}
 	if s.DataDir != "" {
-		_ = config.Save(s.DataDir, config.File{URL: s.URL, Token: s.Token, Controllers: s.controllerURLs()})
+		if token := s.ClientToken(); token != "" {
+			_ = config.Save(s.DataDir, config.File{URL: s.URL, Token: token, Controllers: s.controllerURLs()})
+		}
 	}
 	ctx, cancel := context.WithCancel(ctx)
 	s.cancel = cancel
@@ -289,12 +316,14 @@ func (s *Server) loop(ctx context.Context) {
 	t := time.NewTicker(time.Second)
 	defer t.Stop()
 	_ = s.Reconcile(s.Now())
+	s.triggerInfrastructure(ctx)
 	for {
 		select {
 		case <-ctx.Done():
 			return
 		case <-t.C:
 			_ = s.Reconcile(s.Now())
+			s.triggerInfrastructure(ctx)
 		}
 	}
 }

@@ -60,3 +60,21 @@ func TestHTTPReadinessManifest(t *testing.T) {
 		}
 	}
 }
+
+func TestConfigPolicyAndRouteRejectIgnoredOrInvalidFields(t *testing.T) {
+	for _, body := range []string{
+		"kind: Config\nname: settings\ndata: {nested: {ignored: value}}\n",
+		"kind: Secret\nname: key\ndata: [one, two]\n",
+		"kind: Config\nname: settings\ndtaa: {ignored: value}\n",
+		"kind: Policy\nmove: {cooldwon: 1s}\n",
+		"kind: Policy\nmove: {min_gain: never}\n",
+		"kind: Policy\nmove: {min_gain: .inf}\n",
+		"kind: Policy\nmove_cooldown: -1s\n",
+		"kind: Policy\nauto: [silently-ignored]\n",
+		"kind: Route\nname: web\napp: web\nport: 0\n",
+	} {
+		if _, err := DecodeOne([]byte(body)); err == nil {
+			t.Fatalf("invalid manifest accepted: %s", body)
+		}
+	}
+}

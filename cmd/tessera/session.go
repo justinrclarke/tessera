@@ -68,7 +68,7 @@ func session(in io.Reader, out, errs io.Writer, command func([]string) error, qu
 
 func sessionCommand(word string) bool {
 	switch word {
-	case "help", "-h", "--help", "version", "apply", "get", "confirm", "ask", "import", "backup", "restore", "cloud", "infra", "install", "drill", "up", "agent", "gateway", "controller", "watchdog", "mcp", "session":
+	case "storage", "help", "-h", "--help", "version", "apply", "get", "confirm", "ask", "import", "backup", "restore", "cloud", "infra", "install", "drill", "up", "agent", "gateway", "controller", "watchdog", "mcp", "session", "build", "checkpoint", "delete", "token":
 		return true
 	}
 	return false

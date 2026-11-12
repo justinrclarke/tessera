@@ -2,6 +2,7 @@ package api
 
 import (
 	"fmt"
+	"math"
 	"strconv"
 	"strings"
 )
@@ -13,14 +14,14 @@ func ParseMilliCPU(v any) (int64, error) {
 	}
 	if strings.HasSuffix(s, "m") {
 		n, err := strconv.ParseFloat(strings.TrimSuffix(s, "m"), 64)
-		if err != nil {
-			return 0, fmt.Errorf("cpu %q: %w", s, err)
+		if err != nil || math.IsNaN(n) || math.IsInf(n, 0) || n >= float64(math.MaxInt64) || n < float64(math.MinInt64) {
+			return 0, fmt.Errorf("invalid cpu quantity %q", s)
 		}
 		return int64(n), nil
 	}
 	n, err := strconv.ParseFloat(s, 64)
-	if err != nil {
-		return 0, fmt.Errorf("cpu %q: %w", s, err)
+	if err != nil || math.IsNaN(n) || math.IsInf(n, 0) || n >= float64(math.MaxInt64) || n < float64(math.MinInt64)/1000 {
+		return 0, fmt.Errorf("invalid cpu quantity %q", s)
 	}
 	if n < 50 {
 		return int64(n * 1000), nil
@@ -54,10 +55,17 @@ func ParseMemory(v any) (int64, error) {
 		}
 	}
 	n, err := strconv.ParseFloat(s, 64)
-	if err != nil {
-		return 0, fmt.Errorf("memory %q: %w", scalar(v), err)
+	if err != nil || math.IsNaN(n) || math.IsInf(n, 0) || n*float64(mult) >= float64(math.MaxInt64) || n*float64(mult) < float64(math.MinInt64) {
+		return 0, fmt.Errorf("invalid memory quantity %q", scalar(v))
 	}
 	return int64(n * float64(mult)), nil
+}
+
+func (r Resources) MarshalYAML() (any, error) {
+	return struct {
+		CPU    string `yaml:"cpu"`
+		Memory int64  `yaml:"memory"`
+	}{CPU: strconv.FormatInt(r.CPU, 10) + "m", Memory: r.Memory}, nil
 }
 
 func scalar(v any) string {
